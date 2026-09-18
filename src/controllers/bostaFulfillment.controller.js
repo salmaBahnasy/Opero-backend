@@ -12,6 +12,22 @@ const {
   markOrderSentToBosta,
   applyBostaFulfillmentWebhook,
 } = require("../services/webhookOrders.service");
+const { sendKnownServiceError } = require("../utils/httpErrors");
+const { runWithIntegration } = require("../utils/tenantScope");
+const { resolveOwnedConnection } = require("../services/companyIntegrations.service");
+
+async function withBostaConnection(req, fn) {
+  const connection = await resolveOwnedConnection({
+    provider: "bosta",
+    category: "shipping",
+    integrationId:
+      req.body?.shippingIntegrationId ||
+      req.body?.shipping_integration_id ||
+      req.body?.integrationId ||
+      req.query?.integrationId,
+  });
+  return runWithIntegration(connection, fn);
+}
 
 function pickOverrides(body = {}) {
   const src = body.overrides && typeof body.overrides === "object" ? body.overrides : body;
@@ -79,25 +95,28 @@ function inventoryErrorResponse(error) {
 async function sendOrderToBosta(req, res) {
   try {
     const { orderId } = req.params;
-    const localOrder = await getWebhookOrderById(orderId);
-    const overrides = pickOverrides(req.body || {});
-    const payload = await mapLocalOrderToBostaPayload(localOrder, overrides);
+    await withBostaConnection(req, async () => {
+      const localOrder = await getWebhookOrderById(orderId);
+      const overrides = pickOverrides(req.body || {});
+      const payload = await mapLocalOrderToBostaPayload(localOrder, overrides);
 
-    const bostaResult = await createFulfillmentOrder(payload);
-    const updatedOrder = await markOrderSentToBosta(
-      localOrder.sourceOrderId,
-      bostaResult,
-      payload,
-    );
+      const bostaResult = await createFulfillmentOrder(payload);
+      const updatedOrder = await markOrderSentToBosta(
+        localOrder.sourceOrderId,
+        bostaResult,
+        payload,
+      );
 
-    res.json({
-      success: true,
-      message: "Order sent to Bosta successfully",
-      bosta: bostaResult,
-      webhookUrl: getWebhookUrl(),
-      data: updatedOrder,
+      res.json({
+        success: true,
+        message: "Order sent to Bosta successfully",
+        bosta: bostaResult,
+        webhookUrl: await getWebhookUrl(),
+        data: updatedOrder,
+      });
     });
   } catch (error) {
+    if (sendKnownServiceError(res, error)) return;
     if (
       error.code === "ORDER_NOT_FOUND" ||
       error.code === "INVALID_ORDER_ID"
@@ -155,6 +174,7 @@ async function sendOrdersToBostaBulk(req, res) {
       return;
     }
 
+    const result = await withBostaConnection(req, async () => {
     const sharedOverrides = pickOverrides(req.body || {});
     const perOrderOverrides =
       req.body?.perOrderOverrides && typeof req.body.perOrderOverrides === "object"
@@ -226,12 +246,14 @@ async function sendOrdersToBostaBulk(req, res) {
         failedOrders.length === 0
           ? `${updatedOrders.length} orders processed successfully`
           : `${updatedOrders.length} orders sent, ${failedOrders.length} failed inventory/mapping checks`,
-      webhookUrl: getWebhookUrl(),
+      webhookUrl: await getWebhookUrl(),
       bosta: bostaResult,
       data: updatedOrders,
       failedOrders,
     });
+    });
   } catch (error) {
+    if (sendKnownServiceError(res, error)) return;
     if (error.code === "BOSTA_INVENTORY_UNAVAILABLE") {
       res.status(409).json(inventoryErrorResponse(error));
       return;
@@ -334,28 +356,25 @@ async function handleBostaOrderStatusWebhook(req, res) {
  * Quick check: is Bosta x-api-key configured correctly on this server?
  */
 async function checkBostaFulfillmentHealth(req, res) {
-  const keyInfo = getFulfillmentKeyDiagnostics();
-
   try {
-    const inventory = await fetchBostaInventoryAvailabilityMap();
-    res.json({
-      success: true,
-      message: "Bosta fulfillment API connected",
-      key: keyInfo,
-      inventorySkuCount: inventory.size,
+    await withBostaConnection(req, async () => {
+      const keyInfo = await getFulfillmentKeyDiagnostics();
+      const inventory = await fetchBostaInventoryAvailabilityMap();
+      res.json({
+        success: true,
+        message: "Bosta fulfillment API connected",
+        key: keyInfo,
+        inventorySkuCount: inventory.size,
+      });
     });
   } catch (error) {
+    if (sendKnownServiceError(res, error)) return;
+    const keyInfo = { configured: false, source: "company_integrations" };
     res.status(error.status === 401 ? 401 : 502).json({
       success: false,
       message: error.message,
       code: error.code || "BOSTA_HEALTH_CHECK_FAILED",
       key: keyInfo,
-      hint:
-        keyInfo.looksLikeEasyOrderKey
-          ? "BOSTA_FULFILLMENT_API_KEY looks like EasyOrder Api-Key — use boost_... from Bosta Fulfillment"
-          : !keyInfo.looksLikeBoostKey
-            ? "Set BOSTA_FULFILLMENT_API_KEY=boost_... (same as Postman x-api-key header)"
-            : "Key format OK but Bosta rejected it — copy exact x-api-key from Postman to Render env",
       details: error.details || null,
     });
   }

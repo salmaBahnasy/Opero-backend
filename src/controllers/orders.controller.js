@@ -55,6 +55,7 @@ const {
 const { withCache } = require("../services/dashboardCache.service");
 const { buildOrdersExcelBuffer } = require("../services/ordersExport.service");
 const { getCompanyId } = require("../middlewares/tenant.middleware");
+const { sendKnownServiceError } = require("../utils/httpErrors");
 
 function tenantCachePayload(req, payload) {
   return { companyId: getCompanyId(req), ...payload };
@@ -1019,7 +1020,9 @@ async function getEasyOrderDetails(req, res) {
       return;
     }
 
-    const orderDetails = await easyorderService.getOrderById(orderId);
+    const orderDetails = await easyorderService.getOrderById(orderId, {
+      integrationId: req.query.integrationId || req.query.integration_id,
+    });
     const remoteBase =
       orderDetails?.data && typeof orderDetails.data === "object"
         ? { ...orderDetails, ...orderDetails.data }
@@ -1073,6 +1076,7 @@ async function getEasyOrderDetails(req, res) {
     });
     return;
   } catch (error) {
+    if (sendKnownServiceError(res, error)) return;
     if (error.code === "ORDER_NOT_FOUND") {
       res.status(404).json({
         success: false,
@@ -1129,6 +1133,7 @@ async function refreshCustomerStatus(req, res) {
       },
     });
   } catch (error) {
+    if (sendKnownServiceError(res, error)) return;
     if (error.code === "ORDER_NOT_FOUND" || error.code === "INVALID_ORDER_ID") {
       res.status(error.statusCode || 404).json({
         success: false,

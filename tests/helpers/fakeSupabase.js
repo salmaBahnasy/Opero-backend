@@ -46,6 +46,10 @@ function createFakeSupabase({
   order_cost_daily = [],
   bosta_sku_mappings = [],
   bosta_unmapped_products = [],
+  platform_admins = [],
+  company_integrations = [],
+  features = [],
+  company_features = [],
 } = {}) {
   const db = {
     companies: companies.map((row) => ({ ...row })),
@@ -57,6 +61,10 @@ function createFakeSupabase({
     order_cost_daily: order_cost_daily.map((row) => ({ ...row })),
     bosta_sku_mappings: bosta_sku_mappings.map((row) => ({ ...row })),
     bosta_unmapped_products: bosta_unmapped_products.map((row) => ({ ...row })),
+    platform_admins: platform_admins.map((row) => ({ ...row })),
+    company_integrations: company_integrations.map((row) => ({ ...row })),
+    features: features.map((row) => ({ ...row })),
+    company_features: company_features.map((row) => ({ ...row })),
   };
 
   const sequences = {};
@@ -239,6 +247,9 @@ function createFakeSupabase({
 
       if (this.action === "update") {
         if (!matched.length) {
+          if (mode === "maybe") {
+            return { data: null, error: null };
+          }
           return mode === "many"
             ? { data: [], error: null, count: 0 }
             : { data: null, error: { message: "not found" } };

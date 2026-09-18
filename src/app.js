@@ -9,6 +9,9 @@ const sallaRoutes = require("./routes/salla.routes");
 const easyorderRoutes = require("./routes/easyorder.routes");
 const bostaRoutes = require("./routes/bosta.routes");
 const addedOrdersRoutes = require("./routes/addedOrders.routes");
+const platformRoutes = require("./routes/platform.routes");
+const companyRoutes = require("./routes/company.routes");
+const publicRoutes = require("./routes/public.routes");
 
 function createApp() {
   const app = express();
@@ -30,6 +33,9 @@ function createApp() {
   app.use("/api/salla", sallaRoutes);
   app.use("/api/bosta", bostaRoutes);
   app.use("/api/added-orders", addedOrdersRoutes);
+  app.use("/api/platform", platformRoutes);
+  app.use("/api/company", companyRoutes);
+  app.use("/api/public", publicRoutes);
 
   return app;
 }

@@ -8,6 +8,8 @@ const {
   getJwtSecret,
   signEmployeeToken,
   verifyEmployeeToken,
+  signPlatformAdminToken,
+  verifyPlatformAdminToken,
 } = require("../src/config/jwt");
 
 describe("JWT configuration", () => {
@@ -48,5 +50,33 @@ describe("JWT configuration", () => {
     } finally {
       process.env.JWT_SECRET = previous;
     }
+  });
+
+  it("platform admin tokens are rejected by employee verification", () => {
+    const token = signPlatformAdminToken({
+      platformAdminId: "padmin-1",
+      email: "platform@saas.local",
+    });
+    const decoded = verifyPlatformAdminToken(token);
+    assert.equal(decoded.scope, "platform_admin");
+    assert.equal(decoded.platformAdminId, "padmin-1");
+    assert.equal(decoded.companyId, undefined);
+    assert.throws(() => verifyEmployeeToken(token), (error) => {
+      assert.equal(error.code, "JWT_WRONG_SCOPE");
+      return true;
+    });
+  });
+
+  it("employee tokens are rejected by platform admin verification", () => {
+    const token = signEmployeeToken({
+      employeeId: "emp-1",
+      companyId: "co-1",
+      role: "company_admin",
+      email: "a@b.c",
+    });
+    assert.throws(() => verifyPlatformAdminToken(token), (error) => {
+      assert.equal(error.code, "JWT_WRONG_SCOPE");
+      return true;
+    });
   });
 });

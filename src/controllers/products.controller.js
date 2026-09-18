@@ -3,10 +3,23 @@ const {
   syncProductsFromEasyOrder,
   getProductsFromDb,
 } = require("../services/products.service");
+const { sendKnownServiceError } = require("../utils/httpErrors");
+
+function integrationOptions(req) {
+  return {
+    integrationId:
+      req.query.integrationId ||
+      req.query.integration_id ||
+      req.body?.integrationId ||
+      req.body?.integration_id,
+  };
+}
 
 async function syncProducts(req, res) {
   try {
-    const payload = await easyorderService.getProductsFromEasyOrder();
+    const payload = await easyorderService.getProductsFromEasyOrder(
+      integrationOptions(req),
+    );
     const result = await syncProductsFromEasyOrder(payload);
 
     res.json({
@@ -15,6 +28,7 @@ async function syncProducts(req, res) {
       data: result,
     });
   } catch (error) {
+    if (sendKnownServiceError(res, error)) return;
     res.status(error.response?.status || 500).json({
       success: false,
       message: "Failed to sync products from EasyOrders",
@@ -65,7 +79,10 @@ async function getEasyOrderProductById(req, res) {
       return;
     }
 
-    const product = await easyorderService.getProductById(productId);
+    const product = await easyorderService.getProductById(
+      productId,
+      integrationOptions(req),
+    );
 
     res.json({
       success: true,
@@ -73,6 +90,7 @@ async function getEasyOrderProductById(req, res) {
       data: product,
     });
   } catch (error) {
+    if (sendKnownServiceError(res, error)) return;
     if (error.code === "INVALID_PRODUCT_ID") {
       res.status(400).json({ success: false, message: error.message });
       return;

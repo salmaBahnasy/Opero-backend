@@ -1,20 +1,31 @@
 const axios = require("axios");
+const { getTenantProviderSecrets } = require("./companyIntegrations.service");
 
-function getBaseUrl() {
-  const raw =
-    (process.env.SALLA_BASE_URL || "https://api.salla.dev/admin/v2").trim();
+function getBaseUrl(secrets = {}) {
+  const raw = (
+    secrets.apiBaseUrl ||
+    process.env.SALLA_BASE_URL ||
+    "https://api.salla.dev/admin/v2"
+  ).trim();
   return raw.replace(/\/$/, "");
 }
 
-function getAccessToken() {
-  return (process.env.SALLA_ACCESS_TOKEN || "").trim();
-}
-
-function buildAuthHeaders(tokenOverride) {
-  const token = (tokenOverride || getAccessToken()).trim();
+async function getSallaClient(options = {}) {
+  const { secrets } = await getTenantProviderSecrets("salla", options);
+  const token = String(secrets.accessToken || "").trim();
+  if (!token) {
+    const err = new Error("Salla integration is not configured for this company");
+    err.code = "INTEGRATION_NOT_CONFIGURED";
+    err.provider = "salla";
+    throw err;
+  }
   return {
-    Authorization: `Bearer ${token}`,
-    Accept: "application/json",
+    token,
+    baseUrl: getBaseUrl(secrets),
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/json",
+    },
   };
 }
 
@@ -30,17 +41,12 @@ function normalizeOrdersArray(payload) {
   return [];
 }
 
-async function requestSallaOrders(params, tokenOverride) {
-  const token = (tokenOverride || getAccessToken()).trim();
-  if (!token) {
-    const err = new Error("SALLA_ACCESS_TOKEN is not configured");
-    err.code = "MISSING_SALLA_TOKEN";
-    throw err;
-  }
+async function requestSallaOrders(params, options = {}) {
+  const client = await getSallaClient(options);
 
-  const url = `${getBaseUrl()}/orders`;
+  const url = `${client.baseUrl}/orders`;
   const response = await axios.get(url, {
-    headers: buildAuthHeaders(token),
+    headers: client.headers,
     params: params || {},
     timeout: 60000,
     validateStatus: () => true,
@@ -64,27 +70,27 @@ async function requestSallaOrders(params, tokenOverride) {
 /**
  * GET orders from Salla (pass-through query params, e.g. page, per_page).
  */
-async function fetchSallaOrders(query, tokenOverride) {
-  return requestSallaOrders(query || {}, tokenOverride);
+async function fetchSallaOrders(query, options = {}) {
+  return requestSallaOrders(query || {}, options);
 }
 
 /**
  * Verifies credentials by calling Salla orders list (minimal page).
  */
-async function verifySallaLogin(tokenOverride) {
-  return requestSallaOrders({ page: 1, per_page: 1 }, tokenOverride);
+async function verifySallaLogin(options = {}) {
+  return requestSallaOrders({ page: 1, per_page: 1 }, options);
 }
 
 /**
  * Fetches all orders from Salla (paginated) for stats only.
  */
-async function fetchAllSallaOrdersForStats(tokenOverride) {
+async function fetchAllSallaOrdersForStats(options = {}) {
   const all = [];
   let page = 1;
   const per_page = 50;
 
   for (;;) {
-    const payload = await requestSallaOrders({ page, per_page }, tokenOverride);
+    const payload = await requestSallaOrders({ page, per_page }, options);
     const batch = normalizeOrdersArray(payload);
     if (!batch.length) break;
     all.push(...batch);
@@ -128,7 +134,6 @@ function computeStatsFromSallaOrders(orders) {
 
 module.exports = {
   getBaseUrl,
-  getAccessToken,
   fetchSallaOrders,
   verifySallaLogin,
   fetchAllSallaOrdersForStats,

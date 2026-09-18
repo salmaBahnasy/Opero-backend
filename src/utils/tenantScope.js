@@ -1,6 +1,7 @@
 const { AsyncLocalStorage } = require("node:async_hooks");
 
 const tenantStorage = new AsyncLocalStorage();
+const integrationStorage = new AsyncLocalStorage();
 
 const DEFAULT_TENANT_TABLES = [
   "orders",
@@ -53,9 +54,21 @@ function runWithCompanyId(companyId, fn) {
   return tenantStorage.run(requireCompanyId(companyId), fn);
 }
 
+function runWithIntegration(integration, fn) {
+  return integrationStorage.run(integration || null, fn);
+}
+
+function runWithTenantContext({ companyId, integration }, fn) {
+  return runWithCompanyId(companyId, () => runWithIntegration(integration, fn));
+}
+
 function getActiveCompanyId() {
   const id = tenantStorage.getStore();
   return id ? String(id) : null;
+}
+
+function getActiveIntegration() {
+  return integrationStorage.getStore() || null;
 }
 
 function requireActiveCompanyId() {
@@ -122,7 +135,10 @@ function tenantFrom(client, table) {
 module.exports = {
   requireCompanyId,
   runWithCompanyId,
+  runWithIntegration,
+  runWithTenantContext,
   getActiveCompanyId,
+  getActiveIntegration,
   requireActiveCompanyId,
   isTenantTable,
   tenantFrom,

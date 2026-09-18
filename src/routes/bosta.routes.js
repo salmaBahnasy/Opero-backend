@@ -24,7 +24,7 @@ const router = express.Router();
 const requireTenant = [requireAuth, bindTenantScope];
 
 /** Test Bosta x-api-key on this server (Render vs local). */
-router.get("/fulfillment/health", checkBostaFulfillmentHealth);
+router.get("/fulfillment/health", ...requireTenant, checkBostaFulfillmentHealth);
 
 /** SKU mappings: product / variant / size → Bosta sku codes */
 router.get("/sku-mappings", ...requireTenant, listBostaSkuMappings);

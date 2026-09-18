@@ -1,6 +1,7 @@
 const axios = require("axios");
-const { bosta } = require("../config/env");
 const { isInstapayPaymentMethod } = require("../utils/paymentMethod");
+const { getTenantProviderSecrets, decryptWebhookToken } = require("./companyIntegrations.service");
+const { buildWebhookUrl } = require("../utils/publicUrl");
 
 const PLATFORM = "custom_api";
 const DEFAULT_ORDER_TYPE = "FORWARD";
@@ -12,38 +13,18 @@ function getFulfillmentBaseUrl() {
   ).replace(/\/$/, "");
 }
 
-function getWebhookUrl() {
-  const explicit = (process.env.BOSTA_WEBHOOK_URL || "").trim();
-  let url;
-  if (explicit) {
-    url = explicit;
-  } else {
-    const base = (
-      process.env.APP_PUBLIC_BASE_URL ||
-      process.env.PUBLIC_BASE_URL ||
-      ""
-    )
-      .trim()
-      .replace(/\/$/, "");
-
-    if (!base) {
-      const err = new Error(
-        "Set BOSTA_WEBHOOK_URL or APP_PUBLIC_BASE_URL for Bosta webhook callbacks",
-      );
-      err.code = "BOSTA_WEBHOOK_URL_MISSING";
-      throw err;
-    }
-
-    url = `${base}/webhooks/bosta/order-status`;
+async function getWebhookUrl() {
+  const { row, secrets } = await getTenantProviderSecrets("bosta");
+  const token = decryptWebhookToken(row);
+  if (token) {
+    return buildWebhookUrl("bosta", token);
   }
-
-  const secret = (process.env.BOSTA_WEBHOOK_SECRET || "").trim();
-  if (secret && !/[?&]secret=/.test(url)) {
-    const sep = url.includes("?") ? "&" : "?";
-    url = `${url}${sep}secret=${encodeURIComponent(secret)}`;
+  if (secrets.webhookUrl) {
+    return String(secrets.webhookUrl).trim();
   }
-
-  return url;
+  const err = new Error("Bosta webhook URL is not configured for this company");
+  err.code = "BOSTA_WEBHOOK_URL_MISSING";
+  throw err;
 }
 
 function normalizeFulfillmentApiKey(apiKey) {
@@ -63,25 +44,20 @@ function isFulfillmentApiKey(apiKey) {
   return /^boost_/i.test(normalizeFulfillmentApiKey(apiKey));
 }
 
-function resolveFulfillmentApiKey() {
-  const fulfillmentKey = normalizeFulfillmentApiKey(
-    process.env.BOSTA_FULFILLMENT_API_KEY,
-  );
+async function resolveFulfillmentApiKey() {
+  const { secrets } = await getTenantProviderSecrets("bosta");
+  const fulfillmentKey = normalizeFulfillmentApiKey(secrets.fulfillmentApiKey);
   if (fulfillmentKey) return fulfillmentKey;
-
-  const shippingKey = normalizeFulfillmentApiKey(bosta.apiKey);
-  if (isFulfillmentApiKey(shippingKey)) return shippingKey;
-
+  const shippingKey = normalizeFulfillmentApiKey(secrets.apiKey);
+  if (shippingKey) return shippingKey;
   return "";
 }
 
-function fulfillmentHeaders() {
-  const key = resolveFulfillmentApiKey();
+async function fulfillmentHeaders() {
+  const key = await resolveFulfillmentApiKey();
 
   if (!key) {
-    const err = new Error(
-      "Set BOSTA_FULFILLMENT_API_KEY (boost_...) for send-to-bosta",
-    );
+    const err = new Error("Bosta fulfillment API key is not configured for this company");
     err.code = "BOSTA_FULFILLMENT_API_KEY_MISSING";
     throw err;
   }
@@ -515,7 +491,7 @@ async function mapLocalOrderToBostaPayload(localOrder, overrides = {}) {
     },
     externalPlatform: {
       platform: PLATFORM,
-      webhookUrl: getWebhookUrl(),
+      webhookUrl: await getWebhookUrl(),
     },
     type: firstNonEmpty(overrides.type, DEFAULT_ORDER_TYPE),
   };
@@ -566,7 +542,7 @@ function pickBostaApiErrorMessage(data, fallback) {
 async function postFulfillment(path, body) {
   const url = `${getFulfillmentBaseUrl()}${path}`;
   const response = await axios.post(url, body, {
-    headers: fulfillmentHeaders(),
+    headers: await fulfillmentHeaders(),
     timeout: 120000,
     validateStatus: () => true,
   });
@@ -598,7 +574,7 @@ async function createFulfillmentOrdersBulk(payloads) {
 async function getFulfillment(path, params = {}) {
   const url = `${getFulfillmentBaseUrl()}${path}`;
   const response = await axios.get(url, {
-    headers: fulfillmentHeaders(),
+    headers: await fulfillmentHeaders(),
     params,
     timeout: 120000,
     validateStatus: () => true,
@@ -681,26 +657,26 @@ async function fetchBostaInventoryAvailabilityMap() {
   return availability;
 }
 
-function getFulfillmentKeyDiagnostics() {
-  const fulfillmentEnv = normalizeFulfillmentApiKey(
-    process.env.BOSTA_FULFILLMENT_API_KEY,
-  );
-  const bostaApiEnv = normalizeFulfillmentApiKey(bosta.apiKey);
-  const resolved = resolveFulfillmentApiKey();
-
-  let resolvedSource = "none";
-  if (fulfillmentEnv) resolvedSource = "BOSTA_FULFILLMENT_API_KEY";
-  else if (isFulfillmentApiKey(bostaApiEnv)) resolvedSource = "BOSTA_API_KEY";
-
-  return {
-    hasFulfillmentEnv: Boolean(fulfillmentEnv),
-    hasBostaApiKeyEnv: Boolean(bostaApiEnv),
-    resolvedSource,
-    keyPrefix: resolved ? `${resolved.slice(0, 8)}...` : null,
-    keyLength: resolved ? resolved.length : 0,
-    looksLikeBoostKey: isFulfillmentApiKey(resolved),
-    looksLikeEasyOrderKey: /^[0-9a-f-]{36}$/i.test(resolved),
-  };
+async function getFulfillmentKeyDiagnostics() {
+  try {
+    const key = await resolveFulfillmentApiKey();
+    return {
+      configured: Boolean(key),
+      source: "company_integrations",
+      keyPrefix: key ? `${key.slice(0, 4)}****` : null,
+      keyLength: key ? key.length : 0,
+      looksLikeBoostKey: isFulfillmentApiKey(key),
+    };
+  } catch (error) {
+    return {
+      configured: false,
+      source: "company_integrations",
+      code: error.code || "INTEGRATION_NOT_CONFIGURED",
+      keyPrefix: null,
+      keyLength: 0,
+      looksLikeBoostKey: false,
+    };
+  }
 }
 
 module.exports = {

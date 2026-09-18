@@ -1,24 +1,31 @@
 const axios = require("axios");
+const { getTenantProviderSecrets } = require("./companyIntegrations.service");
 
-const EASYORDER_API_BASE =
-  process.env.EASYORDER_API_BASE_URL ||
+const DEFAULT_EASYORDER_API_BASE =
   "https://api.easy-orders.net/api/v1/external-apps";
 
-async function easyorderHeaders() {
-  const apiKey = process.env.EASYORDER_API_KEY;
-  if (!apiKey) {
-    throw new Error("EASYORDER_API_KEY is not set");
-  }
-  return { "Api-Key": apiKey };
+async function getEasyOrdersClient(options = {}) {
+  const { secrets } = await getTenantProviderSecrets("easyorders", options);
+  const apiKey = String(secrets.apiKey || "").trim();
+  const baseUrl = (
+    secrets.apiBaseUrl ||
+    process.env.EASYORDER_API_BASE_URL ||
+    DEFAULT_EASYORDER_API_BASE
+  ).replace(/\/$/, "");
+
+  return {
+    apiKey,
+    baseUrl,
+    headers: { "Api-Key": apiKey },
+  };
 }
 
-async function getOrderById(orderId) {
-  const url = `${EASYORDER_API_BASE}/orders/${orderId}`;
-
+async function getOrderById(orderId, options = {}) {
+  const client = await getEasyOrdersClient(options);
+  const url = `${client.baseUrl}/orders/${orderId}`;
   const response = await axios.get(url, {
-    headers: await easyorderHeaders(),
+    headers: client.headers,
   });
-
   return response.data;
 }
 
@@ -88,6 +95,13 @@ async function enrichOrderWithEasyOrdersCustomerStatus(order, options = {}) {
   try {
     remote = await getOrderById(orderId);
   } catch (error) {
+    if (
+      error?.code === "INTEGRATION_NOT_CONFIGURED" ||
+      error?.code === "INTEGRATION_DISABLED"
+    ) {
+      if (options.throwOnError) throw error;
+      return { order, easyOrdersConfirm: null };
+    }
     console.warn(
       JSON.stringify({
         source: "easyorder-api",
@@ -176,10 +190,6 @@ async function enrichOrderWithEasyOrdersCustomerStatus(order, options = {}) {
   return { order: enriched, easyOrdersConfirm };
 }
 
-/**
- * Explicit refresh for UI button "إظهار الحالة".
- * Always calls EasyOrders and persists customerStatus.
- */
 async function refreshCustomerStatusFromEasyOrders(orderId) {
   const id = String(orderId || "").trim();
   if (!id) {
@@ -211,7 +221,7 @@ async function refreshCustomerStatusFromEasyOrders(orderId) {
   }
 
   const previousStatus =
-    localOrder.customer_status ?? localOrder.customerStatus ?? "pending";
+    localOrder.customerStatus || localOrder.customer_status || "pending";
 
   const { order, easyOrdersConfirm } =
     await enrichOrderWithEasyOrdersCustomerStatus(
@@ -237,18 +247,17 @@ async function refreshCustomerStatusFromEasyOrders(orderId) {
 }
 
 /** Fetches products list from EasyOrders external-apps API. */
-async function getProductsFromEasyOrder() {
-  const url = `${EASYORDER_API_BASE}/products`;
-
+async function getProductsFromEasyOrder(options = {}) {
+  const client = await getEasyOrdersClient(options);
+  const url = `${client.baseUrl}/products`;
   const response = await axios.get(url, {
-    headers: await easyorderHeaders(),
+    headers: client.headers,
   });
-
   return response.data;
 }
 
 /** GET /products/:product_id — single product from EasyOrders external-apps API. */
-async function getProductById(productId) {
+async function getProductById(productId, options = {}) {
   const id = String(productId || "").trim();
   if (!id) {
     const err = new Error("product_id is required");
@@ -256,12 +265,11 @@ async function getProductById(productId) {
     throw err;
   }
 
-  const url = `${EASYORDER_API_BASE}/products/${encodeURIComponent(id)}`;
-
+  const client = await getEasyOrdersClient(options);
+  const url = `${client.baseUrl}/products/${encodeURIComponent(id)}`;
   const response = await axios.get(url, {
-    headers: await easyorderHeaders(),
+    headers: client.headers,
   });
-
   return response.data;
 }
 
@@ -272,4 +280,5 @@ module.exports = {
   mapEasyOrdersStatusToCustomerStatus,
   enrichOrderWithEasyOrdersCustomerStatus,
   refreshCustomerStatusFromEasyOrders,
+  isManualOrder,
 };

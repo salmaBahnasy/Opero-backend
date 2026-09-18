@@ -4,10 +4,12 @@ require("dotenv").config({
   path: path.resolve(__dirname, "../.env"),
 });
 
-const { getJwtSecret } = require("./config/jwt");
 const { createApp } = require("./app");
+const { getJwtSecret } = require("./config/jwt");
+const { getIntegrationEncryptionKey } = require("./config/integrationSecrets");
 
 getJwtSecret();
+getIntegrationEncryptionKey();
 
 const app = createApp();
 const port = process.env.PORT || 5050;

@@ -1256,6 +1256,12 @@ function mapStoredOrderToClient(row) {
     sourceOrderId: row.order_id,
     status: row.status,
     orderStatus: row.status,
+    source_integration_id: row.source_integration_id ?? raw.source_integration_id ?? null,
+    sourceIntegrationId: row.source_integration_id ?? raw.sourceIntegrationId ?? null,
+    shipping_integration_id:
+      row.shipping_integration_id ?? raw.shipping_integration_id ?? null,
+    shippingIntegrationId:
+      row.shipping_integration_id ?? raw.shippingIntegrationId ?? null,
     customer_status: raw.customer_status,
     customerStatus: raw.customerStatus,
     is_manual: Boolean(raw.is_manual ?? raw.isManual),
@@ -1595,7 +1601,7 @@ function mapBostaStatusToOrderStatus(status) {
   return null;
 }
 
-async function applyBostaFulfillmentWebhook(payload) {
+async function applyBostaFulfillmentWebhook(payload, options = {}) {
   const order = await findOrderForBostaWebhook(payload);
   const shippingStatus = mapBostaStatusToShippingStatus(payload?.status);
   const nextOrderStatus = mapBostaStatusToOrderStatus(payload?.status);
@@ -1617,6 +1623,13 @@ async function applyBostaFulfillmentWebhook(payload) {
     nextOrderStatus ? { status: nextOrderStatus } : {},
   );
 
+  if (options.shippingIntegrationId) {
+    await supabase
+      .from(ORDERS_TABLE)
+      .update({ shipping_integration_id: options.shippingIntegrationId })
+      .eq("order_id", order.sourceOrderId);
+  }
+
   if (nextOrderStatus && previousStatus !== nextOrderStatus) {
     try {
       await insertOrderStatusLog({
@@ -1634,7 +1647,7 @@ async function applyBostaFulfillmentWebhook(payload) {
 }
 
 async function addWebhookOrder(order, options = {}) {
-  const { fromWebhook, actor } = options;
+  const { fromWebhook, actor, sourceIntegrationId } = options;
   const sourceOrderId = resolveSourceOrderId(order);
   const meta = resolveOrderMeta(order, { fromWebhook });
   const raw_data = {
@@ -1737,6 +1750,11 @@ async function addWebhookOrder(order, options = {}) {
     raw_data,
     created_at: createdAt.toISOString(),
   };
+  if (sourceIntegrationId) {
+    payload.source_integration_id = sourceIntegrationId;
+    raw_data.source_integration_id = sourceIntegrationId;
+    raw_data.sourceIntegrationId = sourceIntegrationId;
+  }
   if (orderReference != null && (await hasOrderReferenceColumn())) {
     payload.order_reference = orderReference;
   }

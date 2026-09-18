@@ -35,6 +35,9 @@ function getJwtSecret() {
   return secret;
 }
 
+const SCOPE_COMPANY = "company";
+const SCOPE_PLATFORM_ADMIN = "platform_admin";
+
 function signEmployeeToken({ employeeId, companyId, role, email }) {
   if (!employeeId || !companyId || !role || !email) {
     const error = new Error("employeeId, companyId, role, and email are required to sign a token");
@@ -48,14 +51,46 @@ function signEmployeeToken({ employeeId, companyId, role, email }) {
       companyId,
       role,
       email,
+      scope: SCOPE_COMPANY,
     },
     getJwtSecret(),
     { expiresIn: "7d" },
   );
 }
 
+function signPlatformAdminToken({ platformAdminId, email }) {
+  if (!platformAdminId || !email) {
+    const error = new Error("platformAdminId and email are required to sign a token");
+    error.code = "JWT_PAYLOAD_INCOMPLETE";
+    throw error;
+  }
+
+  return jwt.sign(
+    {
+      platformAdminId,
+      scope: SCOPE_PLATFORM_ADMIN,
+      email,
+    },
+    getJwtSecret(),
+    { expiresIn: "7d" },
+  );
+}
+
+function isPlatformAdminPayload(decoded) {
+  return (
+    decoded &&
+    (decoded.scope === SCOPE_PLATFORM_ADMIN || Boolean(decoded.platformAdminId))
+  );
+}
+
 function verifyEmployeeToken(token) {
   const decoded = jwt.verify(token, getJwtSecret());
+  if (isPlatformAdminPayload(decoded)) {
+    const error = new Error("Platform admin token cannot be used for company routes");
+    error.code = "JWT_WRONG_SCOPE";
+    throw error;
+  }
+
   const employeeId = decoded.employeeId || decoded.id;
   const companyId = decoded.companyId;
   const role = decoded.role;
@@ -72,6 +107,26 @@ function verifyEmployeeToken(token) {
     companyId,
     role,
     email,
+    scope: SCOPE_COMPANY,
+  };
+}
+
+function verifyPlatformAdminToken(token) {
+  const decoded = jwt.verify(token, getJwtSecret());
+  if (
+    decoded.scope !== SCOPE_PLATFORM_ADMIN ||
+    !decoded.platformAdminId ||
+    decoded.companyId
+  ) {
+    const error = new Error("Platform admin token required");
+    error.code = "JWT_WRONG_SCOPE";
+    throw error;
+  }
+
+  return {
+    platformAdminId: decoded.platformAdminId,
+    scope: SCOPE_PLATFORM_ADMIN,
+    email: decoded.email,
   };
 }
 
@@ -80,5 +135,9 @@ module.exports = {
   isRecognizedDevEnv,
   signEmployeeToken,
   verifyEmployeeToken,
+  signPlatformAdminToken,
+  verifyPlatformAdminToken,
+  SCOPE_COMPANY,
+  SCOPE_PLATFORM_ADMIN,
   INSECURE_DEFAULT_SECRET,
 };

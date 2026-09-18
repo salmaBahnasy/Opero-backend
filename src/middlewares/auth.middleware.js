@@ -69,11 +69,15 @@ function requireAuth(req, res, next) {
     next();
   } catch (error) {
     const missingCompany = error && error.code === "JWT_COMPANY_ID_MISSING";
-    res.status(401).json({
+    const wrongScope = error && error.code === "JWT_WRONG_SCOPE";
+    res.status(wrongScope ? 403 : 401).json({
       success: false,
-      message: missingCompany
-        ? "Unauthorized. Token must include companyId."
-        : "Invalid or expired token",
+      code: wrongScope ? "JWT_WRONG_SCOPE" : undefined,
+      message: wrongScope
+        ? "Forbidden. Company token required."
+        : missingCompany
+          ? "Unauthorized. Token must include companyId."
+          : "Invalid or expired token",
     });
   }
 }
