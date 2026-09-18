@@ -17,6 +17,8 @@ const {
   withCache,
   clearDashboardCache,
 } = require("../src/services/dashboardCache.service");
+const { runWithCompanyId } = require("../src/utils/tenantScope");
+const tenantSupabase = require("../src/config/tenantSupabase");
 
 const ENAYA_ID = "11111111-1111-4111-8111-111111111111";
 const OTHER_ID = "22222222-2222-4222-8222-222222222222";
@@ -321,7 +323,17 @@ describe("tenant isolation", () => {
     assert.equal(b.json.data.full_name, "Other Customer");
   });
 
-  it("F + G. same easyorder_id can exist in both companies and lists are isolated", async () => {
+  it("F. products with the same easyorder_id can exist in different companies", async () => {
+    const a = await request("GET", "/api/products", { token: enayaToken() });
+    const b = await request("GET", "/api/products", { token: otherToken() });
+    assert.equal(a.status, 200);
+    assert.equal(b.status, 200);
+    assert.equal(a.json.data[0].easyorder_id, SHARED_EASYORDER_ID);
+    assert.equal(b.json.data[0].easyorder_id, SHARED_EASYORDER_ID);
+    assert.notEqual(a.json.data[0].id, b.json.data[0].id);
+  });
+
+  it("G. product lists are tenant isolated", async () => {
     const a = await request("GET", "/api/products", { token: enayaToken() });
     const b = await request("GET", "/api/products", { token: otherToken() });
     assert.equal(a.status, 200);
@@ -334,7 +346,22 @@ describe("tenant isolation", () => {
     assert.equal(b.json.data[0].name, "Other Product");
   });
 
-  it("H. added orders are tenant isolated", async () => {
+  it("H. Company A cannot modify Company B product", async () => {
+    await runWithCompanyId(ENAYA_ID, async () => {
+      await tenantSupabase
+        .from("products")
+        .update({ name: "Hacked", company_id: OTHER_ID })
+        .eq("easyorder_id", SHARED_EASYORDER_ID);
+    });
+
+    const other = fake.__db.products.find((row) => row.id === "prod-other");
+    const enaya = fake.__db.products.find((row) => row.id === "prod-enaya");
+    assert.equal(other.name, "Other Product");
+    assert.equal(enaya.name, "Hacked");
+    assert.equal(enaya.company_id, ENAYA_ID);
+  });
+
+  it("I. added orders are tenant isolated", async () => {
     const a = await request("GET", "/api/added-orders", { token: enayaToken() });
     assert.equal(a.status, 200);
     const names = (a.json.data || []).map((row) => row.customerName);
@@ -359,7 +386,7 @@ describe("tenant isolation", () => {
     );
   });
 
-  it("I. status logs are tenant isolated", async () => {
+  it("J. order status logs are tenant isolated", async () => {
     await request("PATCH", `/api/orders/${SHARED_ORDER_ID}/status`, {
       token: enayaToken(),
       body: { status: "follow up" },
@@ -378,7 +405,7 @@ describe("tenant isolation", () => {
     );
   });
 
-  it("J. daily cost data is tenant isolated", async () => {
+  it("K. daily cost/statistics data is tenant isolated", async () => {
     const saved = await request("POST", "/api/orders/charts/order-cost", {
       token: enayaToken(),
       body: { date: "2026-09-18", expense: 12, company_id: OTHER_ID },
@@ -396,7 +423,7 @@ describe("tenant isolation", () => {
     );
   });
 
-  it("K. Bosta SKU mappings are tenant isolated", async () => {
+  it("L. Bosta SKU mappings/unmapped products are tenant isolated", async () => {
     const a = await request("GET", "/api/bosta/sku-mappings", {
       token: enayaToken(),
     });
@@ -411,7 +438,7 @@ describe("tenant isolation", () => {
     assert.equal(b.json.data.productSkuMap[SHARED_EASYORDER_ID].name, "Other map");
   });
 
-  it("L. dashboard/statistics cache cannot leak between companies", async () => {
+  it("M. dashboard/statistics cache cannot leak between companies", async () => {
     const keyA = buildCacheKey("orders-stats", { companyId: ENAYA_ID, x: 1 });
     const keyB = buildCacheKey("orders-stats", { companyId: OTHER_ID, x: 1 });
     assert.notEqual(keyA, keyB);
@@ -435,7 +462,7 @@ describe("tenant isolation", () => {
     assert.throws(() => buildCacheKey("orders-stats", { x: 1 }));
   });
 
-  it("M. company_id in body/query cannot override JWT companyId", async () => {
+  it("N. company_id/companyId supplied in request body/query cannot override JWT companyId", async () => {
     const created = await request("POST", "/api/orders", {
       token: enayaToken(),
       body: {
@@ -453,5 +480,38 @@ describe("tenant isolation", () => {
     );
     assert.ok(inserted);
     assert.equal(inserted.company_id, ENAYA_ID);
+  });
+
+  it("O. legacy /api/easyorder aliases cannot bypass tenant isolation", async () => {
+    const openList = await request(
+      "GET",
+      "/api/easyorder/orders?from=2020-01-01&to=2030-12-31",
+    );
+    const openProducts = await request("GET", "/api/easyorder/products");
+    const openStats = await request("GET", "/api/easyorder/stats");
+    assert.equal(openList.status, 401);
+    assert.equal(openProducts.status, 401);
+    assert.equal(openStats.status, 401);
+
+    const list = await request(
+      "GET",
+      "/api/easyorder/orders?from=2020-01-01&to=2030-12-31",
+      { token: enayaToken() },
+    );
+    assert.equal(list.status, 200);
+    assert.equal(
+      (list.json.data || []).every((row) => row.full_name !== "Other Customer"),
+      true,
+    );
+
+    const products = await request("GET", "/api/easyorder/products", {
+      token: enayaToken(),
+    });
+    assert.equal(products.status, 200);
+    assert.equal(products.json.data[0].name, "Enaya Product");
+    assert.equal(
+      (products.json.data || []).every((row) => row.name !== "Other Product"),
+      true,
+    );
   });
 });

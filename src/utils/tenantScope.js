@@ -90,8 +90,14 @@ function tenantFrom(client, table) {
 
   return new Proxy(base, {
     get(target, prop, receiver) {
-      if (prop === "select" || prop === "update") {
+      if (prop === "select") {
         return (...args) => target[prop](...args).eq("company_id", companyId);
+      }
+      if (prop === "update") {
+        return (row, ...rest) =>
+          target
+            .update(withCompanyPayload(row, companyId), ...rest)
+            .eq("company_id", companyId);
       }
       if (prop === "delete") {
         return (...args) => target.delete(...args).eq("company_id", companyId);
