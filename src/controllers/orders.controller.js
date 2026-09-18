@@ -54,6 +54,11 @@ const {
 } = require("../services/orderCostDaily.service");
 const { withCache } = require("../services/dashboardCache.service");
 const { buildOrdersExcelBuffer } = require("../services/ordersExport.service");
+const { getCompanyId } = require("../middlewares/tenant.middleware");
+
+function tenantCachePayload(req, payload) {
+  return { companyId: getCompanyId(req), ...payload };
+}
 
 /** مثال لجسم POST /api/orders — الحقول الاختيارية: order_source (افتراضي store)، order_type (افتراضي new)، shipping_status (افتراضي in_progress)، status (افتراضي new). */
 const POST_ORDER_MANUAL_EXAMPLE = {
@@ -1250,7 +1255,7 @@ async function getOrdersStats(req, res) {
 
     const stats = await withCache(
       "orders-stats",
-      {
+      tenantCachePayload(req, {
         employeeId,
         ignoreEmployeeLogDateRange,
         from: from?.toISOString() || null,
@@ -1261,7 +1266,7 @@ async function getOrdersStats(req, res) {
         status,
         product_id,
         product_sku,
-      },
+      }),
       () =>
         getOrdersStatistics({
           employeeId,
@@ -1414,7 +1419,7 @@ async function getOrdersStatsTrend(req, res) {
 
     const chart = await withCache(
       "orders-stats-trend",
-      {
+      tenantCachePayload(req, {
         employeeId,
         ignoreEmployeeLogDateRange,
         from: from.toISOString(),
@@ -1427,7 +1432,7 @@ async function getOrdersStatsTrend(req, res) {
         product_id,
         product_sku,
         useEgyptBuckets: isEasyOrderApiRequest(req),
-      },
+      }),
       () =>
         getOrdersStatsTimeSeries({
           from,
@@ -1825,12 +1830,12 @@ async function getOrderCostChartHandler(req, res) {
 
     const chart = await withCache(
       "order-cost-chart",
-      {
+      tenantCachePayload(req, {
         from: from.toISOString(),
         to: to.toISOString(),
         granularity,
         dateBasis,
-      },
+      }),
       () =>
         getOrderCostChartFromStorage({
           from,

@@ -18,39 +18,42 @@ const {
 } = require("../controllers/bostaSkuMappings.controller");
 const { checkBostaFulfillmentHealth } = require("../controllers/bostaFulfillment.controller");
 const { requireAuth } = require("../middlewares/auth.middleware");
+const { bindTenantScope } = require("../middlewares/tenant.middleware");
 
 const router = express.Router();
+const requireTenant = [requireAuth, bindTenantScope];
 
 /** Test Bosta x-api-key on this server (Render vs local). */
 router.get("/fulfillment/health", checkBostaFulfillmentHealth);
 
 /** SKU mappings: product / variant / size → Bosta sku codes */
-router.get("/sku-mappings", listBostaSkuMappings);
-router.post("/sku-mappings/import", requireAuth, importBostaSkuMappingsHandler);
-router.post("/sku-mappings", requireAuth, addBostaSkuMappingHandler);
+router.get("/sku-mappings", ...requireTenant, listBostaSkuMappings);
+router.post("/sku-mappings/import", ...requireTenant, importBostaSkuMappingsHandler);
+router.post("/sku-mappings", ...requireTenant, addBostaSkuMappingHandler);
 router.delete(
   "/sku-mappings/unmapped/:productId",
-  requireAuth,
+  ...requireTenant,
   deleteUnmappedProductHandler,
 );
 router.get(
   "/sku-mappings/by-product/:productId",
+  ...requireTenant,
   getBostaSkuOptionsByProductHandler,
 );
-router.get("/sku-mappings/:mappingType/:entityId", getBostaSkuMappingHandler);
+router.get("/sku-mappings/:mappingType/:entityId", ...requireTenant, getBostaSkuMappingHandler);
 router.put(
   "/sku-mappings/:mappingType/:entityId",
-  requireAuth,
+  ...requireTenant,
   updateBostaSkuMappingHandler,
 );
 router.patch(
   "/sku-mappings/:mappingType/:entityId",
-  requireAuth,
+  ...requireTenant,
   updateBostaSkuMappingHandler,
 );
 router.delete(
   "/sku-mappings/:mappingType/:entityId",
-  requireAuth,
+  ...requireTenant,
   deleteBostaSkuMappingHandler,
 );
 

@@ -22,31 +22,34 @@ const {
   sendOrderToBosta,
   sendOrdersToBostaBulk,
 } = require("../controllers/bostaFulfillment.controller");
-const { requireAuth, optionalAuth } = require("../middlewares/auth.middleware");
+const { requireAuth } = require("../middlewares/auth.middleware");
+const { bindTenantScope } = require("../middlewares/tenant.middleware");
 
-router.get("/stats/trend", getOrdersStatsTrend);
-router.get("/stats", getOrdersStats);
-router.get("/analytics", getOrdersAnalytics);
-router.get("/charts/product-sales", getProductSalesChartHandler);
-router.post("/charts/order-cost", saveOrderCostDailyHandler);
-router.get("/charts/order-cost", getOrderCostChartHandler);
-router.get("/costs", getOrderCosts);
-router.get("/export", requireAuth, exportOrders);
-router.post("/export", requireAuth, exportOrders);
-router.get("/reference/:orderReference", getOrderByReference);
-router.get("/reference", getOrderByReference);
-router.post("/send-to-bosta/bulk", requireAuth, sendOrdersToBostaBulk);
-router.post("/", optionalAuth, createOrder);
-router.patch("/:orderId", requireAuth, updateOrder);
-router.get("/", getOrders);
-router.patch("/:orderId/status", requireAuth, changeOrderStatus);
+const requireTenant = [requireAuth, bindTenantScope];
+
+router.get("/stats/trend", ...requireTenant, getOrdersStatsTrend);
+router.get("/stats", ...requireTenant, getOrdersStats);
+router.get("/analytics", ...requireTenant, getOrdersAnalytics);
+router.get("/charts/product-sales", ...requireTenant, getProductSalesChartHandler);
+router.post("/charts/order-cost", ...requireTenant, saveOrderCostDailyHandler);
+router.get("/charts/order-cost", ...requireTenant, getOrderCostChartHandler);
+router.get("/costs", ...requireTenant, getOrderCosts);
+router.get("/export", ...requireTenant, exportOrders);
+router.post("/export", ...requireTenant, exportOrders);
+router.get("/reference/:orderReference", ...requireTenant, getOrderByReference);
+router.get("/reference", ...requireTenant, getOrderByReference);
+router.post("/send-to-bosta/bulk", ...requireTenant, sendOrdersToBostaBulk);
+router.post("/", ...requireTenant, createOrder);
+router.patch("/:orderId", ...requireTenant, updateOrder);
+router.get("/", ...requireTenant, getOrders);
+router.patch("/:orderId/status", ...requireTenant, changeOrderStatus);
 router.post(
   "/:orderId/refresh-customer-status",
-  requireAuth,
+  ...requireTenant,
   refreshCustomerStatus,
 );
-router.get("/:orderId", getEasyOrderDetails);
+router.get("/:orderId", ...requireTenant, getEasyOrderDetails);
 
-router.post("/:orderId/send-to-bosta", requireAuth, sendOrderToBosta);
+router.post("/:orderId/send-to-bosta", ...requireTenant, sendOrderToBosta);
 
 module.exports = router;

@@ -2,6 +2,7 @@ require("dotenv").config();
 
 module.exports = {
   port: process.env.PORT || 5050,
+  nodeEnv: process.env.NODE_ENV || "",
 
   easyorder: {
     apiKey: process.env.EASYORDER_API_KEY,

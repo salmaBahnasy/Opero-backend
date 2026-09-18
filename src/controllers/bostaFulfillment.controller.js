@@ -308,6 +308,15 @@ async function handleBostaOrderStatusWebhook(req, res) {
       data: updatedOrder,
     });
   } catch (error) {
+    if (error.code === "TENANT_CONTEXT_MISSING") {
+      res.status(503).json({
+        success: false,
+        code: "TENANT_CONTEXT_MISSING",
+        message:
+          "Bosta webhook tenant resolution is not implemented yet. This endpoint cannot guess companyId.",
+      });
+      return;
+    }
     if (error.code === "ORDER_NOT_FOUND") {
       res.status(404).json({ success: false, message: error.message });
       return;

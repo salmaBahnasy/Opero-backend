@@ -14,6 +14,22 @@ if (!supabaseUrl || !supabaseKey) {
   );
 }
 
-const supabase = createClient(supabaseUrl, supabaseKey);
+const realClient = createClient(supabaseUrl, supabaseKey);
+let activeClient = realClient;
+
+const supabase = {
+  from(...args) {
+    return activeClient.from(...args);
+  },
+  rpc(...args) {
+    return activeClient.rpc(...args);
+  },
+  __setClientForTests(nextClient) {
+    if (process.env.NODE_ENV !== "test") {
+      throw new Error("supabase test client can only be replaced when NODE_ENV=test");
+    }
+    activeClient = nextClient || realClient;
+  },
+};
 
 module.exports = supabase;

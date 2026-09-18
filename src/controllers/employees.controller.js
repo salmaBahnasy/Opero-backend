@@ -1,25 +1,29 @@
 const bcrypt = require("bcryptjs");
-const jwt = require("jsonwebtoken");
 const supabase = require("../config/supabase");
+const { signEmployeeToken } = require("../config/jwt");
+const { getCompanyId } = require("../middlewares/tenant.middleware");
+const {
+  ALLOWED_ROLES,
+  normalizeRole,
+  normalizeRoleForApp,
+  isKnownRoleInput,
+  withEmployeeRoleKeys,
+} = require("../utils/roles");
 
 const EMPLOYEES_TABLE = process.env.SUPABASE_EMPLOYEES_TABLE || "employees";
-/** أدوار التطبيق: أدمن أو موظف فقط. القيم القديمة في DB تُعرَّف وتحوّل للعرض وللـ JWT عند تسجيل الدخول. */
-const ALLOWED_ROLES = ["admin", "employee"];
+const COMPANIES_TABLE = process.env.SUPABASE_COMPANIES_TABLE || "companies";
 
-/** يُرجع دائمًا `admin` أو `employee` للـ API والتوكن. */
-function normalizeRoleForApp(dbRole) {
-  const r = String(dbRole || "").trim().toLowerCase();
-  if (r === "admin") return "admin";
-  if (r === "employee") return "employee";
-  if (r === "senior" || r === "agent") return "admin";
-  return "employee";
-}
+const EMPLOYEE_PUBLIC_COLUMNS =
+  "id,company_id,name,email,phone,role,is_active,created_at,updated_at";
 
-/** نفس قيمة `role` تحت مفتاح إضافي للواجهات (`admin` | `employee`). */
-function withEmployeeRoleKeys(row) {
-  if (!row || typeof row !== "object") return row;
-  const role = normalizeRoleForApp(row.role);
-  return { ...row, role, employeeRole: role };
+function pickLoginField(body, ...keys) {
+  if (!body || typeof body !== "object") return "";
+  for (const key of keys) {
+    if (body[key] != null && String(body[key]).trim() !== "") {
+      return String(body[key]).trim();
+    }
+  }
+  return "";
 }
 
 function pickRoleFromBody(body) {
@@ -50,45 +54,71 @@ function coerceIsActive(raw) {
   return null;
 }
 
-function buildSafeEmployee(employee) {
+function toPublicEmployee(employee) {
   if (!employee) return null;
+  const { password, company_id: companyIdCol, ...safeEmployee } = employee;
+  return {
+    ...withEmployeeRoleKeys(safeEmployee),
+    companyId: companyIdCol ?? employee.companyId ?? null,
+  };
+}
 
-  const { password, ...safeEmployee } = employee;
-  return withEmployeeRoleKeys(safeEmployee);
+function invalidCredentials(res) {
+  res.status(401).json({
+    success: false,
+    message: "Invalid credentials",
+  });
 }
 
 async function login(req, res) {
   try {
-    const { email, password } = req.body;
+    const body = req.body || {};
+    const companySlug = pickLoginField(body, "companySlug", "company_slug").toLowerCase();
+    const email = pickLoginField(body, "email").toLowerCase();
+    const password = body.password;
 
-    if (!email || !password) {
+    if (!companySlug || !email || !password) {
       res.status(400).json({
         success: false,
-        message: "email and password are required",
+        message: "companySlug, email and password are required",
       });
       return;
     }
 
-    const { data: employee, error } = await supabase
+    const { data: company, error: companyError } = await supabase
+      .from(COMPANIES_TABLE)
+      .select("id,slug,is_active,deleted_at")
+      .eq("slug", companySlug)
+      .maybeSingle();
+
+    if (companyError) {
+      throw new Error(companyError.message);
+    }
+
+    if (!company || company.is_active === false || company.deleted_at) {
+      invalidCredentials(res);
+      return;
+    }
+
+    const { data: employee, error: employeeError } = await supabase
       .from(EMPLOYEES_TABLE)
       .select("*")
+      .eq("company_id", company.id)
       .eq("email", email)
-      .single();
+      .maybeSingle();
 
-    if (error || !employee) {
-      res.status(401).json({
-        success: false,
-        message: "Invalid credentials",
-      });
+    if (employeeError) {
+      throw new Error(employeeError.message);
+    }
+
+    if (!employee) {
+      invalidCredentials(res);
       return;
     }
 
     const isValidPassword = await bcrypt.compare(password, employee.password);
     if (!isValidPassword) {
-      res.status(401).json({
-        success: false,
-        message: "Invalid credentials",
-      });
+      invalidCredentials(res);
       return;
     }
 
@@ -100,39 +130,57 @@ async function login(req, res) {
       return;
     }
 
-    const appRole = normalizeRoleForApp(employee.role);
-
-    const token = jwt.sign(
-      {
-        employeeId: employee.id,
-        role: appRole,
-        employeeRole: appRole,
-        email: employee.email,
-      },
-      process.env.JWT_SECRET || "dev-secret-change-me",
-      { expiresIn: "7d" },
-    );
+    const role = normalizeRole(employee.role);
+    const token = signEmployeeToken({
+      employeeId: employee.id,
+      companyId: company.id,
+      role,
+      email: employee.email,
+    });
 
     res.json({
       success: true,
       message: "Login successful",
       token,
-      data: buildSafeEmployee(employee),
+      data: toPublicEmployee({ ...employee, company_id: company.id }),
     });
   } catch (error) {
+    console.error("[login] failed", {
+      message: error?.message,
+      code: error?.code,
+    });
+    const isDev = ["development", "dev", "test"].includes(
+      String(process.env.NODE_ENV || "").toLowerCase(),
+    );
     res.status(500).json({
       success: false,
       message: "Failed to login",
-      error: error.message,
+      ...(isDev ? { error: error?.message } : {}),
     });
   }
 }
 
+function employeesTable() {
+  return supabase.from(EMPLOYEES_TABLE);
+}
+
+function rejectMissingTenant(res, companyId) {
+  if (companyId) return false;
+  res.status(401).json({
+    success: false,
+    message: "Unauthorized. Token must include companyId.",
+  });
+  return true;
+}
+
 async function getEmployees(req, res) {
   try {
-    const { data, error } = await supabase
-      .from(EMPLOYEES_TABLE)
-      .select("id,name,email,phone,role,is_active,created_at,updated_at")
+    const companyId = getCompanyId(req);
+    if (rejectMissingTenant(res, companyId)) return;
+
+    const { data, error } = await employeesTable()
+      .select(EMPLOYEE_PUBLIC_COLUMNS)
+      .eq("company_id", companyId)
       .order("created_at", { ascending: false });
 
     if (error) {
@@ -141,22 +189,23 @@ async function getEmployees(req, res) {
 
     res.json({
       success: true,
-      total: data.length,
-      data: (data || []).map((row) => withEmployeeRoleKeys(row)),
+      total: (data || []).length,
+      data: (data || []).map((row) => toPublicEmployee(row)),
     });
   } catch (error) {
     res.status(500).json({
       success: false,
       message: "Failed to fetch employees",
-      error: error.message,
     });
   }
 }
 
 async function addEmployee(req, res) {
   try {
-    const { name, email, password } = req.body;
-    const role = pickRoleFromBody(req.body);
+    const companyId = getCompanyId(req);
+    if (rejectMissingTenant(res, companyId)) return;
+    const { name, email, password } = req.body || {};
+    const roleInput = pickRoleFromBody(req.body);
 
     if (!name || !email || !password) {
       res.status(400).json({
@@ -166,7 +215,7 @@ async function addEmployee(req, res) {
       return;
     }
 
-    if (!ALLOWED_ROLES.includes(role)) {
+    if (!isKnownRoleInput(roleInput)) {
       res.status(400).json({
         success: false,
         message: "Invalid role",
@@ -176,17 +225,19 @@ async function addEmployee(req, res) {
     }
 
     const hashedPassword = await bcrypt.hash(password, 10);
+    const role = normalizeRole(roleInput);
 
     const { data, error } = await supabase
       .from(EMPLOYEES_TABLE)
       .insert({
+        company_id: companyId,
         name,
-        email,
+        email: String(email).trim().toLowerCase(),
         password: hashedPassword,
         role,
         is_active: true,
       })
-      .select("id,name,email,phone,role,is_active,created_at,updated_at")
+      .select(EMPLOYEE_PUBLIC_COLUMNS)
       .single();
 
     if (error) {
@@ -196,24 +247,25 @@ async function addEmployee(req, res) {
     res.status(201).json({
       success: true,
       message: "Employee added successfully",
-      data: withEmployeeRoleKeys(data),
+      data: toPublicEmployee(data),
     });
   } catch (error) {
     res.status(500).json({
       success: false,
       message: "Failed to add employee",
-      error: error.message,
     });
   }
 }
 
 async function deleteEmployee(req, res) {
   try {
+    const companyId = getCompanyId(req);
+    if (rejectMissingTenant(res, companyId)) return;
     const { employeeId } = req.params;
 
-    const { data, error } = await supabase
-      .from(EMPLOYEES_TABLE)
+    const { data, error } = await employeesTable()
       .delete()
+      .eq("company_id", companyId)
       .eq("id", employeeId)
       .select("id")
       .single();
@@ -235,13 +287,14 @@ async function deleteEmployee(req, res) {
     res.status(500).json({
       success: false,
       message: "Failed to delete employee",
-      error: error.message,
     });
   }
 }
 
 async function editEmployee(req, res) {
   try {
+    const companyId = getCompanyId(req);
+    if (rejectMissingTenant(res, companyId)) return;
     const { employeeId } = req.params;
     const {
       name,
@@ -252,12 +305,12 @@ async function editEmployee(req, res) {
       employeeRole,
       is_active,
       account_status,
-    } = req.body;
+    } = req.body || {};
 
     const updates = {};
 
     if (name !== undefined) updates.name = name;
-    if (email !== undefined) updates.email = email;
+    if (email !== undefined) updates.email = String(email).trim().toLowerCase();
     if (phone !== undefined) updates.phone = phone;
 
     if (account_status !== undefined) {
@@ -303,16 +356,16 @@ async function editEmployee(req, res) {
         });
         return;
       }
-      if (!ALLOWED_ROLES.includes(r)) {
+      if (!isKnownRoleInput(r)) {
         res.status(400).json({
           success: false,
           message: "Invalid role",
           allowedRoles: ALLOWED_ROLES,
-          hint: "Send role or employeeRole (admin | employee)",
+          hint: "Send role or employeeRole (company_admin | admin | employee)",
         });
         return;
       }
-      updates.role = r;
+      updates.role = normalizeRole(r);
     }
 
     if (password !== undefined) {
@@ -330,11 +383,11 @@ async function editEmployee(req, res) {
 
     updates.updated_at = new Date().toISOString();
 
-    const { data, error } = await supabase
-      .from(EMPLOYEES_TABLE)
+    const { data, error } = await employeesTable()
       .update(updates)
+      .eq("company_id", companyId)
       .eq("id", employeeId)
-      .select("id,name,email,phone,role,is_active,created_at,updated_at")
+      .select(EMPLOYEE_PUBLIC_COLUMNS)
       .single();
 
     if (error || !data) {
@@ -348,21 +401,23 @@ async function editEmployee(req, res) {
     res.json({
       success: true,
       message: "Employee updated successfully",
-      data: withEmployeeRoleKeys(data),
+      data: toPublicEmployee(data),
     });
   } catch (error) {
     res.status(500).json({
       success: false,
       message: "Failed to update employee",
-      error: error.message,
     });
   }
 }
 
 async function setEmployeeActive(req, res) {
   try {
+    const companyId = getCompanyId(req);
+    if (rejectMissingTenant(res, companyId)) return;
     const { employeeId } = req.params;
-    const activeRaw = req.body.active ?? req.body.is_active ?? req.body.account_status;
+    const activeRaw =
+      req.body.active ?? req.body.is_active ?? req.body.account_status;
 
     if (activeRaw === undefined) {
       res.status(400).json({
@@ -381,14 +436,14 @@ async function setEmployeeActive(req, res) {
       return;
     }
 
-    const { data, error } = await supabase
-      .from(EMPLOYEES_TABLE)
+    const { data, error } = await employeesTable()
       .update({
         is_active: coerced,
         updated_at: new Date().toISOString(),
       })
+      .eq("company_id", companyId)
       .eq("id", employeeId)
-      .select("id,name,email,phone,role,is_active,created_at,updated_at")
+      .select(EMPLOYEE_PUBLIC_COLUMNS)
       .single();
 
     if (error || !data) {
@@ -402,13 +457,12 @@ async function setEmployeeActive(req, res) {
     res.json({
       success: true,
       message: coerced ? "Employee activated" : "Employee deactivated",
-      data: withEmployeeRoleKeys(data),
+      data: toPublicEmployee(data),
     });
   } catch (error) {
     res.status(500).json({
       success: false,
       message: "Failed to update employee status",
-      error: error.message,
     });
   }
 }

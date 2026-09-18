@@ -1,5 +1,7 @@
 const express = require("express");
 
+const { requireAuth } = require("../middlewares/auth.middleware");
+const { bindTenantScope } = require("../middlewares/tenant.middleware");
 const { login } = require("../controllers/employees.controller");
 const {
   getOrdersStats,
@@ -24,13 +26,15 @@ const router = express.Router();
  */
 router.post("/auth/login", login);
 
+const requireTenant = [requireAuth, bindTenantScope];
+
 /** Some clients use /api/easyorder/stats instead of /api/easyorder/orders/stats */
-router.get("/stats", getOrdersStats);
-router.get("/analytics", getOrdersAnalytics);
-router.get("/charts/product-sales", getProductSalesChartHandler);
-router.post("/charts/order-cost", saveOrderCostDailyHandler);
-router.get("/charts/order-cost", getOrderCostChartHandler);
-router.get("/costs", getOrderCosts);
+router.get("/stats", ...requireTenant, getOrdersStats);
+router.get("/analytics", ...requireTenant, getOrdersAnalytics);
+router.get("/charts/product-sales", ...requireTenant, getProductSalesChartHandler);
+router.post("/charts/order-cost", ...requireTenant, saveOrderCostDailyHandler);
+router.get("/charts/order-cost", ...requireTenant, getOrderCostChartHandler);
+router.get("/costs", ...requireTenant, getOrderCosts);
 
 router.use("/orders", ordersRoutes);
 router.use("/employees", employeesRoutes);

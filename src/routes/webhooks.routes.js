@@ -1,21 +1,16 @@
 const express = require("express");
 const router = express.Router();
 
-const {
-  addWebhookOrder,
-  getWebhookOrders,
-} = require("../services/webhookOrders.service");
+const { addWebhookOrder } = require("../services/webhookOrders.service");
 const {
   handleBostaOrderStatusWebhook,
 } = require("../controllers/bostaFulfillment.controller");
-const {
-  toPresentation,
-} = require("../services/easyorderPresentation.service");
 
 router.post("/bosta/order-status", handleBostaOrderStatusWebhook);
 
 router.post("/easyorders/order-created", async (req, res) => {
   try {
+    // Phase 4: resolve company from company_integrations. Do not guess tenant.
     const savedOrder = await addWebhookOrder(req.body, { fromWebhook: true });
 
     res.status(200).json({
@@ -24,6 +19,15 @@ router.post("/easyorders/order-created", async (req, res) => {
       data: savedOrder,
     });
   } catch (error) {
+    if (error.code === "TENANT_CONTEXT_MISSING") {
+      res.status(503).json({
+        success: false,
+        code: "TENANT_CONTEXT_MISSING",
+        message:
+          "EasyOrders webhook tenant resolution is not implemented yet. This endpoint cannot guess companyId.",
+      });
+      return;
+    }
     res.status(500).json({
       success: false,
       message: "Failed to save webhook order",
@@ -33,47 +37,11 @@ router.post("/easyorders/order-created", async (req, res) => {
 });
 
 router.get("/easyorders/orders", async (req, res) => {
-  let orders = [];
-  try {
-    orders = await getWebhookOrders();
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Failed to fetch webhook orders",
-      error: error.message,
-    });
-    return;
-  }
-
-  if (req.query.raw === "true") {
-    res.json({
-      success: true,
-      total: orders.length,
-      data: orders,
-    });
-    return;
-  }
-
-  const data = orders.map((entry) => {
-    const { receivedAt, ...payload } = entry;
-    const order = toPresentation(payload);
-
-    if (!order) {
-      return {
-        receivedAt,
-        order: null,
-        note:
-          "Could not map payload to order; add ?raw=true to see stored body.",
-      };
-    }
-
-    return { receivedAt, order };
-  });
-
-  res.json({
-    success: true,
-    total: data.length,
-    data,
+  res.status(503).json({
+    success: false,
+    code: "TENANT_CONTEXT_MISSING",
+    message:
+      "Listing webhook orders without tenant context is disabled. Use authenticated /api/orders. Webhook tenant resolution is Phase 4.",
   });
 });
 

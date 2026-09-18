@@ -1,4 +1,4 @@
-const supabase = require("../config/supabase");
+const supabase = require("../config/tenantSupabase");
 const {
   getEgyptDayRange,
   getEgyptTrendBucketKey,
@@ -239,7 +239,7 @@ async function saveOrderCostDailyEntry({
 
   const { data, error } = await supabase
     .from(ORDER_COST_DAILY_TABLE)
-    .upsert(payload, { onConflict: "cost_date" })
+    .upsert(payload, { onConflict: "company_id,cost_date" })
     .select()
     .single();
 
@@ -249,7 +249,8 @@ async function saveOrderCostDailyEntry({
 
   try {
     const { clearDashboardCache } = require("./dashboardCache.service");
-    clearDashboardCache();
+    const { getActiveCompanyId } = require("../utils/tenantScope");
+    clearDashboardCache(getActiveCompanyId());
   } catch {
     // ignore cache clear failures
   }

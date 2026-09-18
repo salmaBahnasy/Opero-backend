@@ -1,6 +1,6 @@
 const crypto = require("crypto");
 
-const supabase = require("../config/supabase");
+const supabase = require("../config/tenantSupabase");
 
 const PRODUCTS_TABLE =
   process.env.SUPABASE_PRODUCTS_TABLE || "products";
@@ -77,7 +77,7 @@ async function syncProductsFromEasyOrder(easyOrderPayload) {
   }
 
   const { error } = await supabase.from(PRODUCTS_TABLE).upsert(rows, {
-    onConflict: "easyorder_id",
+    onConflict: "company_id,easyorder_id",
   });
 
   if (error) {

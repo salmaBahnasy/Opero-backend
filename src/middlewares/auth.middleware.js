@@ -1,4 +1,5 @@
-const jwt = require("jsonwebtoken");
+const { verifyEmployeeToken } = require("../config/jwt");
+const { normalizeRole, toPublicRole } = require("../utils/roles");
 
 function readBearerToken(req) {
   const authHeader = req.headers.authorization || "";
@@ -10,19 +11,31 @@ function readBearerToken(req) {
 }
 
 function decodeEmployeeFromToken(token) {
-  const jwtSecret = process.env.JWT_SECRET || "dev-secret-change-me";
-  const decoded = jwt.verify(token, jwtSecret);
+  const decoded = verifyEmployeeToken(token);
+  const role = normalizeRole(decoded.role);
+  const employeeId = String(decoded.employeeId).trim();
+  const companyId = String(decoded.companyId).trim();
+
   return {
-    id: decoded.employeeId,
-    role: decoded.role,
-    employeeRole: decoded.employeeRole ?? decoded.role,
+    employeeId,
+    companyId,
+    role,
     email: decoded.email,
+    // Compatibility aliases for existing ERP handlers (orders / added-orders).
+    id: employeeId,
+    employeeRole: toPublicRole(role),
   };
+}
+
+function attachAuthenticatedUser(req, token) {
+  req.user = decodeEmployeeFromToken(token);
+  // Tenant id is only taken from the JWT. Ignore any client-supplied override.
+  return req.user;
 }
 
 /**
  * Sets req.user when a valid Bearer token is sent; otherwise continues without req.user.
- * Invalid tokens are ignored (no 401) so unauthenticated clients keep working.
+ * A present but invalid / company-less token is rejected (401).
  */
 function optionalAuth(req, res, next) {
   const token = readBearerToken(req);
@@ -31,11 +44,14 @@ function optionalAuth(req, res, next) {
     return;
   }
   try {
-    req.user = decodeEmployeeFromToken(token);
+    attachAuthenticatedUser(req, token);
+    next();
   } catch {
-    // ignore bad/expired token for optional routes
+    res.status(401).json({
+      success: false,
+      message: "Invalid or expired token",
+    });
   }
-  next();
 }
 
 function requireAuth(req, res, next) {
@@ -49,12 +65,15 @@ function requireAuth(req, res, next) {
       return;
     }
 
-    req.user = decodeEmployeeFromToken(token);
+    attachAuthenticatedUser(req, token);
     next();
   } catch (error) {
+    const missingCompany = error && error.code === "JWT_COMPANY_ID_MISSING";
     res.status(401).json({
       success: false,
-      message: "Invalid or expired token",
+      message: missingCompany
+        ? "Unauthorized. Token must include companyId."
+        : "Invalid or expired token",
     });
   }
 }
@@ -62,4 +81,6 @@ function requireAuth(req, res, next) {
 module.exports = {
   requireAuth,
   optionalAuth,
+  decodeEmployeeFromToken,
+  readBearerToken,
 };

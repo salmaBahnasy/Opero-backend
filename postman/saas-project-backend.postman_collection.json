@@ -1,8 +1,8 @@
 {
   "info": {
     "_postman_id": "eob-bosta-collection-001",
-    "name": "EasyOrder Bosta Backend",
-    "description": "API collection for easyorder-bosta-backend. Set collection variable `baseUrl` (e.g. https://easyorder-bosta-backend.onrender.com or http://localhost:5050). Use `token` (JWT) for protected routes.",
+    "name": "SaaS Project Backend",
+    "description": "API collection for saas-project-backend. Set collection variable `baseUrl` (e.g. https://easyorder-bosta-backend.onrender.com or http://localhost:5050). Use `token` (JWT) for protected routes.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [

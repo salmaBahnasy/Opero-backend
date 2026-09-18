@@ -1,6 +1,6 @@
 const crypto = require("crypto");
 
-const supabase = require("../config/supabase");
+const supabase = require("../config/tenantSupabase");
 const {
   getEgyptTrendBucketKey,
   listEgyptTrendBucketKeys,
@@ -1151,13 +1151,33 @@ async function insertOrderStatusLog({
   newStatus,
   changedBy,
 }) {
-  const { error } = await supabase.from(ORDER_STATUS_LOGS_TABLE).insert({
+  const { getActiveCompanyId } = require("../utils/tenantScope");
+  const payload = {
     order_id: orderId,
     old_status: oldStatus,
     new_status: newStatus,
     changed_by: changedBy,
     changed_at: new Date().toISOString(),
-  });
+  };
+  const companyId = getActiveCompanyId();
+  if (companyId) {
+    payload.company_id = companyId;
+  }
+
+  try {
+    const { data: orderRow } = await supabase
+      .from(ORDERS_TABLE)
+      .select("id")
+      .eq("order_id", orderId)
+      .maybeSingle();
+    if (orderRow?.id) {
+      payload.order_uuid = orderRow.id;
+    }
+  } catch {
+    // Keep external order_id even if the uuid lookup fails.
+  }
+
+  const { error } = await supabase.from(ORDER_STATUS_LOGS_TABLE).insert(payload);
 
   if (error) {
     throw new Error(error.message);
@@ -1725,7 +1745,7 @@ async function addWebhookOrder(order, options = {}) {
   for (let attempt = 0; attempt < 3; attempt++) {
     const { data, error } = await supabase
       .from(ORDERS_TABLE)
-      .upsert(payload, { onConflict: "order_id" })
+      .upsert(payload, { onConflict: "company_id,order_id" })
       .select()
       .single();
 

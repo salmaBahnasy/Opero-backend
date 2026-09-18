@@ -22,7 +22,13 @@ function stableStringify(value) {
 }
 
 function buildCacheKey(namespace, payload) {
-  return `${namespace}:${stableStringify(payload)}`;
+  const companyId = String(payload?.companyId || "").trim();
+  if (!companyId) {
+    const error = new Error("Dashboard cache payload must include companyId");
+    error.code = "TENANT_CONTEXT_MISSING";
+    throw error;
+  }
+  return `${namespace}:${companyId}:${stableStringify(payload)}`;
 }
 
 function getCached(key) {
@@ -60,8 +66,18 @@ async function withCache(namespace, payload, fn, ttlMs = DEFAULT_TTL_MS) {
   return { value, cacheHit: false };
 }
 
-function clearDashboardCache() {
-  store.clear();
+function clearDashboardCache(companyId) {
+  const scoped = String(companyId || "").trim();
+  if (!scoped) {
+    store.clear();
+    return;
+  }
+  const needle = `:${scoped}:`;
+  for (const key of [...store.keys()]) {
+    if (key.includes(needle)) {
+      store.delete(key);
+    }
+  }
 }
 
 module.exports = {

@@ -1,4 +1,4 @@
-const supabase = require("../config/supabase");
+const supabase = require("../config/tenantSupabase");
 
 const MAPPINGS_TABLE =
   process.env.SUPABASE_BOSTA_SKU_MAPPINGS_TABLE || "bosta_sku_mappings";
@@ -380,7 +380,7 @@ async function replaceUnmappedProducts(unmappedProducts) {
 
   const { data, error } = await supabase
     .from(UNMAPPED_TABLE)
-    .upsert(rows, { onConflict: "product_id" })
+    .upsert(rows, { onConflict: "company_id,product_id" })
     .select();
 
   if (error) {
