@@ -3,7 +3,7 @@ const CORE_FEATURE_KEYS = ["orders", "products", "employees", "analytics"];
 const COMPANY_BRANDING_COLUMNS =
   "id,name,slug,logo_url,login_image_url,favicon_url,primary_color,secondary_color,is_active,deleted_at";
 
-const SAFE_INTEGRATION_COLUMNS = "id,provider,category,name,is_enabled";
+const SAFE_INTEGRATION_COLUMNS = "id,provider,category,name,is_enabled,settings";
 
 function emptyToNull(value) {
   if (value == null) return null;

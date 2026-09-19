@@ -2,6 +2,7 @@ const express = require("express");
 
 const { requireAuth } = require("../middlewares/auth.middleware");
 const { bindTenantScope } = require("../middlewares/tenant.middleware");
+const { requireCompanyFeature } = require("../middlewares/feature.middleware");
 const { login } = require("../controllers/employees.controller");
 const {
   getOrdersStats,
@@ -24,17 +25,20 @@ const router = express.Router();
  * Frontend base: /api/easyorder/… mirrors the same handlers as /api/orders, /api/employees, /api/products, /api/salla.
  * Uses the same router modules (mounted again) so paths stay in sync without duplicating handler wiring.
  */
+/** @deprecated Use POST /api/employees/login */
 router.post("/auth/login", login);
 
 const requireTenant = [requireAuth, bindTenantScope];
+const requireOrders = [...requireTenant, requireCompanyFeature("orders")];
+const requireAnalytics = [...requireTenant, requireCompanyFeature("analytics")];
 
 /** Some clients use /api/easyorder/stats instead of /api/easyorder/orders/stats */
-router.get("/stats", ...requireTenant, getOrdersStats);
-router.get("/analytics", ...requireTenant, getOrdersAnalytics);
-router.get("/charts/product-sales", ...requireTenant, getProductSalesChartHandler);
-router.post("/charts/order-cost", ...requireTenant, saveOrderCostDailyHandler);
-router.get("/charts/order-cost", ...requireTenant, getOrderCostChartHandler);
-router.get("/costs", ...requireTenant, getOrderCosts);
+router.get("/stats", ...requireAnalytics, getOrdersStats);
+router.get("/analytics", ...requireAnalytics, getOrdersAnalytics);
+router.get("/charts/product-sales", ...requireAnalytics, getProductSalesChartHandler);
+router.post("/charts/order-cost", ...requireOrders, saveOrderCostDailyHandler);
+router.get("/charts/order-cost", ...requireOrders, getOrderCostChartHandler);
+router.get("/costs", ...requireOrders, getOrderCosts);
 
 router.use("/orders", ordersRoutes);
 router.use("/employees", employeesRoutes);

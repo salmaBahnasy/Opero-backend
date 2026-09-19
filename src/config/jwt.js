@@ -54,7 +54,7 @@ function signEmployeeToken({ employeeId, companyId, role, email }) {
       scope: SCOPE_COMPANY,
     },
     getJwtSecret(),
-    { expiresIn: "7d" },
+    { algorithm: "HS256", expiresIn: "7d" },
   );
 }
 
@@ -72,7 +72,7 @@ function signPlatformAdminToken({ platformAdminId, email }) {
       email,
     },
     getJwtSecret(),
-    { expiresIn: "7d" },
+    { algorithm: "HS256", expiresIn: "7d" },
   );
 }
 
@@ -84,7 +84,7 @@ function isPlatformAdminPayload(decoded) {
 }
 
 function verifyEmployeeToken(token) {
-  const decoded = jwt.verify(token, getJwtSecret());
+  const decoded = jwt.verify(token, getJwtSecret(), { algorithms: ["HS256"] });
   if (isPlatformAdminPayload(decoded)) {
     const error = new Error("Platform admin token cannot be used for company routes");
     error.code = "JWT_WRONG_SCOPE";
@@ -112,7 +112,7 @@ function verifyEmployeeToken(token) {
 }
 
 function verifyPlatformAdminToken(token) {
-  const decoded = jwt.verify(token, getJwtSecret());
+  const decoded = jwt.verify(token, getJwtSecret(), { algorithms: ["HS256"] });
   if (
     decoded.scope !== SCOPE_PLATFORM_ADMIN ||
     !decoded.platformAdminId ||

@@ -1,5 +1,7 @@
 const { verifyEmployeeToken } = require("../config/jwt");
 const { normalizeRole, toPublicRole } = require("../utils/roles");
+const { revalidateCompanyEmployee } = require("../services/companySession.service");
+const { sendInternalError } = require("../utils/safeError");
 
 function readBearerToken(req) {
   const authHeader = req.headers.authorization || "";
@@ -33,28 +35,59 @@ function attachAuthenticatedUser(req, token) {
   return req.user;
 }
 
+async function attachFreshCompanySession(req, token) {
+  const fromJwt = attachAuthenticatedUser(req, token);
+  const fresh = await revalidateCompanyEmployee({
+    companyId: fromJwt.companyId,
+    employeeId: fromJwt.employeeId,
+  });
+  req.user = fresh;
+  return req.user;
+}
+
+function sendAuthFailure(res, error) {
+  const missingCompany = error && error.code === "JWT_COMPANY_ID_MISSING";
+  const wrongScope = error && error.code === "JWT_WRONG_SCOPE";
+  const sessionInvalid = error && error.code === "SESSION_INVALID";
+  const lookupFailed = error && error.code === "SESSION_LOOKUP_FAILED";
+  if (lookupFailed) {
+    sendInternalError(res, "Failed to validate session", error, "auth");
+    return;
+  }
+  res.status(wrongScope ? 403 : 401).json({
+    success: false,
+    code: wrongScope
+      ? "JWT_WRONG_SCOPE"
+      : sessionInvalid
+        ? "SESSION_INVALID"
+        : undefined,
+    message: wrongScope
+      ? "Forbidden. Company token required."
+      : missingCompany
+        ? "Unauthorized. Token must include companyId."
+        : "Invalid or expired token",
+  });
+}
+
 /**
  * Sets req.user when a valid Bearer token is sent; otherwise continues without req.user.
  * A present but invalid / company-less token is rejected (401).
  */
-function optionalAuth(req, res, next) {
+async function optionalAuth(req, res, next) {
   const token = readBearerToken(req);
   if (!token) {
     next();
     return;
   }
   try {
-    attachAuthenticatedUser(req, token);
+    await attachFreshCompanySession(req, token);
     next();
-  } catch {
-    res.status(401).json({
-      success: false,
-      message: "Invalid or expired token",
-    });
+  } catch (error) {
+    sendAuthFailure(res, error);
   }
 }
 
-function requireAuth(req, res, next) {
+async function requireAuth(req, res, next) {
   try {
     const token = readBearerToken(req);
     if (!token) {
@@ -65,20 +98,10 @@ function requireAuth(req, res, next) {
       return;
     }
 
-    attachAuthenticatedUser(req, token);
+    await attachFreshCompanySession(req, token);
     next();
   } catch (error) {
-    const missingCompany = error && error.code === "JWT_COMPANY_ID_MISSING";
-    const wrongScope = error && error.code === "JWT_WRONG_SCOPE";
-    res.status(wrongScope ? 403 : 401).json({
-      success: false,
-      code: wrongScope ? "JWT_WRONG_SCOPE" : undefined,
-      message: wrongScope
-        ? "Forbidden. Company token required."
-        : missingCompany
-          ? "Unauthorized. Token must include companyId."
-          : "Invalid or expired token",
-    });
+    sendAuthFailure(res, error);
   }
 }
 

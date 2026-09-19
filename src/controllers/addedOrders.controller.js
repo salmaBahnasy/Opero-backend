@@ -2,6 +2,7 @@ const {
   createAddedOrder,
   listAddedOrders,
 } = require("../services/addedOrders.service");
+const { sendInternalError } = require("../utils/safeError");
 
 function pickBodyField(body, ...keys) {
   if (!body || typeof body !== "object") return undefined;
@@ -71,11 +72,7 @@ async function postAddedOrder(req, res) {
       return;
     }
 
-    res.status(500).json({
-      success: false,
-      message: "Failed to register added order",
-      error: error.message,
-    });
+    sendInternalError(res, "Request failed", error, "orders");
   }
 }
 
@@ -134,11 +131,7 @@ async function getAddedOrders(req, res) {
       return;
     }
 
-    res.status(500).json({
-      success: false,
-      message: "Failed to fetch added orders",
-      error: error.message,
-    });
+    sendInternalError(res, "Request failed", error, "orders");
   }
 }
 

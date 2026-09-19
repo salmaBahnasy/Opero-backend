@@ -1,4 +1,13 @@
 const supabase = require("../config/tenantSupabase");
+const {
+  resolveBostaShippingConnection,
+  requireCatalogProductById,
+  resolveCatalogProduct,
+  resolveLineCatalogProduct,
+  isUuid,
+  pickShippingIntegrationId,
+} = require("./bostaShipping.service");
+const { getActiveIntegration } = require("../utils/tenantScope");
 
 const MAPPINGS_TABLE =
   process.env.SUPABASE_BOSTA_SKU_MAPPINGS_TABLE || "bosta_sku_mappings";
@@ -7,6 +16,17 @@ const UNMAPPED_TABLE =
   "bosta_unmapped_products";
 
 const MAPPING_TYPES = ["product", "variant", "size"];
+
+function isLegacyMappingRow(row) {
+  return !row?.shipping_integration_id || !row?.catalog_product_id;
+}
+
+function isAttributedToShipping(row, shippingId) {
+  return (
+    String(row?.shipping_integration_id || "") === String(shippingId || "") &&
+    Boolean(row?.catalog_product_id)
+  );
+}
 
 function normalizeSkus(value) {
   if (!Array.isArray(value)) return [];
@@ -55,30 +75,76 @@ function rowToSizeEntry(row) {
   };
 }
 
-function buildAggregatedMaps(rows, unmappedRows) {
+function buildAttributedMaps(rows) {
   const productSkuMap = {};
   const variantSkuMap = {};
   const sizeSkuMap = {};
+  const variantByCatalog = {};
 
   for (const row of rows || []) {
+    const catalogId = String(row.catalog_product_id || "").trim();
+    if (!catalogId) continue;
     if (row.mapping_type === "product") {
-      productSkuMap[row.entity_id] = rowToProductEntry(row);
+      productSkuMap[catalogId] = rowToProductEntry(row);
     } else if (row.mapping_type === "variant") {
-      variantSkuMap[row.entity_id] = rowToVariantEntry(row);
+      variantSkuMap[row.entity_id] = {
+        ...rowToVariantEntry(row),
+        catalogProductId: catalogId,
+      };
+      if (!variantByCatalog[catalogId]) variantByCatalog[catalogId] = {};
+      variantByCatalog[catalogId][row.entity_id] = {
+        ...rowToVariantEntry(row),
+        catalogProductId: catalogId,
+      };
     } else if (row.mapping_type === "size") {
-      sizeSkuMap[row.entity_id] = rowToSizeEntry(row);
+      sizeSkuMap[catalogId] = rowToSizeEntry(row);
     }
   }
 
   return {
     productSkuMap,
     variantSkuMap,
+    variantByCatalog,
     sizeSkuMap,
-    unmappedProducts: (unmappedRows || []).map((row) => ({
-      productId: row.product_id,
-      name: row.name || "",
-      reason: row.reason || "",
-    })),
+  };
+}
+
+function presentMappingRow(row) {
+  if (!row) return null;
+  const legacy = isLegacyMappingRow(row);
+  const base = {
+    id: row.id,
+    mappingType: row.mapping_type,
+    entityId: row.entity_id,
+    catalogProductId: row.catalog_product_id || null,
+    shippingIntegrationId: row.shipping_integration_id || null,
+    name: row.name || "",
+    legacy,
+  };
+  if (row.mapping_type === "product") {
+    return { ...base, skus: normalizeSkus(row.skus) };
+  }
+  if (row.mapping_type === "variant") {
+    return {
+      ...base,
+      productId: row.product_id || null,
+      size: row.size || null,
+      skus: normalizeSkus(row.skus),
+    };
+  }
+  return { ...base, sizes: normalizeSizes(row.sizes) || {} };
+}
+
+function presentUnmappedRow(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    productId: row.product_id,
+    catalogProductId: row.catalog_product_id || null,
+    shippingIntegrationId: row.shipping_integration_id || null,
+    name: row.name || "",
+    reason: row.reason || "",
+    legacy: isLegacyMappingRow(row),
   };
 }
 
@@ -109,15 +175,62 @@ async function fetchUnmappedRows() {
   return data || [];
 }
 
-async function getBostaSkuMappings() {
+async function loadAttributedMapsForShipping(shippingId) {
   const [rows, unmappedRows] = await Promise.all([
     fetchAllMappingRows(),
     fetchUnmappedRows(),
   ]);
-  return buildAggregatedMaps(rows, unmappedRows);
+  const attributed = rows.filter((row) => isAttributedToShipping(row, shippingId));
+  const unmapped = unmappedRows.filter((row) =>
+    isAttributedToShipping(row, shippingId),
+  );
+  return {
+    ...buildAttributedMaps(attributed),
+    unmappedProducts: unmapped.map((row) => ({
+      id: row.id,
+      productId: row.product_id,
+      catalogProductId: row.catalog_product_id,
+      name: row.name || "",
+      reason: row.reason || "",
+    })),
+    rows: attributed,
+  };
 }
 
-async function getBostaSkuMapping(mappingType, entityId) {
+async function getBostaSkuMappings(options = {}) {
+  const shipping = await resolveBostaShippingConnection(
+    options.shippingIntegrationId || pickShippingIntegrationId(options),
+  );
+  const [rows, unmappedRows] = await Promise.all([
+    fetchAllMappingRows(),
+    fetchUnmappedRows(),
+  ]);
+  const attributed = rows.filter((row) => isAttributedToShipping(row, shipping.id));
+  const unmapped = unmappedRows.filter((row) =>
+    isAttributedToShipping(row, shipping.id),
+  );
+  const legacyMappings = rows.filter(isLegacyMappingRow).map(presentMappingRow);
+  const legacyUnmapped = unmappedRows
+    .filter(isLegacyMappingRow)
+    .map(presentUnmappedRow);
+  const maps = buildAttributedMaps(attributed);
+
+  return {
+    shippingIntegrationId: shipping.id,
+    mappings: attributed.map(presentMappingRow),
+    productSkuMap: maps.productSkuMap,
+    variantSkuMap: maps.variantSkuMap,
+    sizeSkuMap: maps.sizeSkuMap,
+    unmappedProducts: unmapped.map(presentUnmappedRow),
+    legacyMappings,
+    legacyUnmappedProducts: legacyUnmapped,
+  };
+}
+
+async function getBostaSkuMapping(mappingType, entityId, options = {}) {
+  const shipping = await resolveBostaShippingConnection(
+    options.shippingIntegrationId || pickShippingIntegrationId(options),
+  );
   const type = String(mappingType || "").trim();
   const id = String(entityId || "").trim();
 
@@ -132,22 +245,44 @@ async function getBostaSkuMapping(mappingType, entityId) {
     throw err;
   }
 
-  const { data, error } = await supabase
-    .from(MAPPINGS_TABLE)
-    .select("*")
-    .eq("mapping_type", type)
-    .eq("entity_id", id)
-    .maybeSingle();
+  const rows = await fetchAllMappingRows();
+  const attributed = rows.filter((row) => isAttributedToShipping(row, shipping.id));
+  const hit =
+    attributed.find((row) => {
+      if (row.mapping_type !== type) return false;
+      if (type === "variant") return String(row.entity_id) === id;
+      return (
+        String(row.catalog_product_id) === id || String(row.entity_id) === id
+      );
+    }) || null;
 
-  if (error) {
-    throw new Error(error.message);
-  }
-  if (!data) {
+  if (!hit) {
     const err = new Error("Mapping not found");
     err.code = "MAPPING_NOT_FOUND";
     throw err;
   }
 
+  return hit;
+}
+
+async function getBostaSkuMappingById(mappingId) {
+  const id = String(mappingId || "").trim();
+  if (!isUuid(id)) {
+    const err = new Error("mapping id is required");
+    err.code = "INVALID_ENTITY_ID";
+    throw err;
+  }
+  const { data, error } = await supabase
+    .from(MAPPINGS_TABLE)
+    .select("*")
+    .eq("id", id)
+    .maybeSingle();
+  if (error) throw new Error(error.message);
+  if (!data) {
+    const err = new Error("Mapping not found");
+    err.code = "MAPPING_NOT_FOUND";
+    throw err;
+  }
   return data;
 }
 
@@ -162,15 +297,13 @@ function validateMappingPayload(input, { forUpdate = false } = {}) {
     throw err;
   }
 
-  const entityId = String(
-    input.entityId ?? input.entity_id ?? input.productId ?? input.variantId ?? "",
+  const catalogProductId = String(
+    input.catalogProductId ?? input.catalog_product_id ?? "",
   ).trim();
 
-  if (!forUpdate && !entityId) {
-    const err = new Error("entityId is required");
-    err.code = "INVALID_ENTITY_ID";
-    throw err;
-  }
+  const entityId = String(
+    input.entityId ?? input.entity_id ?? input.variantId ?? "",
+  ).trim();
 
   const name = String(input.name ?? "").trim();
   if (!forUpdate && !name) {
@@ -181,10 +314,9 @@ function validateMappingPayload(input, { forUpdate = false } = {}) {
 
   const payload = {
     mapping_type: mappingType,
-    entity_id: entityId,
     updated_at: new Date().toISOString(),
   };
-
+  if (catalogProductId) payload.catalog_product_id = catalogProductId;
   if (name) payload.name = name;
 
   if (mappingType === "product") {
@@ -195,16 +327,16 @@ function validateMappingPayload(input, { forUpdate = false } = {}) {
       throw err;
     }
     if (input.skus !== undefined) payload.skus = skus;
-    payload.product_id = null;
+    payload.product_id = catalogProductId || null;
     payload.size = null;
     payload.sizes = null;
+    payload.entity_id = catalogProductId || entityId;
   }
 
   if (mappingType === "variant") {
-    const productId = String(input.productId ?? input.product_id ?? "").trim();
-    if (!forUpdate && !productId) {
-      const err = new Error("productId is required for variant mappings");
-      err.code = "INVALID_PRODUCT_ID";
+    if (!forUpdate && !entityId) {
+      const err = new Error("entityId (provider variant id) is required for variant mappings");
+      err.code = "INVALID_ENTITY_ID";
       throw err;
     }
     const skus = normalizeSkus(input.skus);
@@ -213,7 +345,8 @@ function validateMappingPayload(input, { forUpdate = false } = {}) {
       err.code = "INVALID_SKUS";
       throw err;
     }
-    if (productId) payload.product_id = productId;
+    if (entityId) payload.entity_id = entityId;
+    payload.product_id = catalogProductId || null;
     if (input.size != null) payload.size = String(input.size).trim();
     if (input.skus !== undefined) payload.skus = skus;
     payload.sizes = null;
@@ -227,16 +360,32 @@ function validateMappingPayload(input, { forUpdate = false } = {}) {
       throw err;
     }
     if (input.sizes !== undefined) payload.sizes = sizes;
-    payload.product_id = null;
+    payload.product_id = catalogProductId || null;
     payload.size = null;
     payload.skus = [];
+    payload.entity_id = catalogProductId || entityId;
   }
 
   return payload;
 }
 
 async function addBostaSkuMapping(input) {
-  const payload = validateMappingPayload(input);
+  const shipping = await resolveBostaShippingConnection(
+    pickShippingIntegrationId(input),
+    { required: true },
+  );
+  const catalog = await requireCatalogProductById(
+    input.catalogProductId ?? input.catalog_product_id,
+  );
+  const payload = validateMappingPayload({
+    ...input,
+    catalogProductId: catalog.id,
+  });
+  payload.shipping_integration_id = shipping.id;
+  payload.catalog_product_id = catalog.id;
+  if (payload.mapping_type !== "variant") {
+    payload.entity_id = catalog.id;
+  }
 
   const { data, error } = await supabase
     .from(MAPPINGS_TABLE)
@@ -246,7 +395,7 @@ async function addBostaSkuMapping(input) {
 
   if (error) {
     if (String(error.code) === "23505") {
-      const dup = new Error("Mapping already exists for this type and entityId");
+      const dup = new Error("Mapping already exists for this Bosta account and catalog product");
       dup.code = "MAPPING_EXISTS";
       throw dup;
     }
@@ -257,28 +406,41 @@ async function addBostaSkuMapping(input) {
 }
 
 async function updateBostaSkuMapping(mappingType, entityId, input) {
-  const type = String(mappingType || "").trim();
-  const id = String(entityId || "").trim();
+  const existing = await getBostaSkuMapping(mappingType, entityId, input);
+  return updateBostaSkuMappingById(existing.id, input);
+}
 
-  if (!MAPPING_TYPES.includes(type)) {
-    const err = new Error('mappingType must be "product", "variant", or "size"');
-    err.code = "INVALID_MAPPING_TYPE";
+async function updateBostaSkuMappingById(mappingId, input) {
+  const existing = await getBostaSkuMappingById(mappingId);
+  if (isLegacyMappingRow(existing)) {
+    const err = new Error("Legacy mappings cannot be edited in place");
+    err.code = "LEGACY_MAPPING_READONLY";
     throw err;
   }
-  if (!id) {
-    const err = new Error("entityId is required");
-    err.code = "INVALID_ENTITY_ID";
-    throw err;
+  if (input.shippingIntegrationId || input.shipping_integration_id) {
+    const shipping = await resolveBostaShippingConnection(
+      pickShippingIntegrationId(input),
+    );
+    if (String(existing.shipping_integration_id) !== String(shipping.id)) {
+      const err = new Error("Mapping not found");
+      err.code = "MAPPING_NOT_FOUND";
+      throw err;
+    }
   }
-
-  await getBostaSkuMapping(type, id);
 
   const patch = validateMappingPayload(
-    { ...input, mappingType: type, entityId: id },
+    {
+      ...input,
+      mappingType: existing.mapping_type,
+      entityId: existing.entity_id,
+      catalogProductId: existing.catalog_product_id,
+    },
     { forUpdate: true },
   );
   delete patch.mapping_type;
   delete patch.entity_id;
+  delete patch.catalog_product_id;
+  delete patch.shipping_integration_id;
 
   if (!Object.keys(patch).length) {
     const err = new Error("No fields to update");
@@ -289,8 +451,7 @@ async function updateBostaSkuMapping(mappingType, entityId, input) {
   const { data, error } = await supabase
     .from(MAPPINGS_TABLE)
     .update(patch)
-    .eq("mapping_type", type)
-    .eq("entity_id", id)
+    .eq("id", existing.id)
     .select()
     .single();
 
@@ -301,37 +462,42 @@ async function updateBostaSkuMapping(mappingType, entityId, input) {
   return data;
 }
 
-async function deleteBostaSkuMapping(mappingType, entityId) {
-  const type = String(mappingType || "").trim();
-  const id = String(entityId || "").trim();
-
-  if (!MAPPING_TYPES.includes(type)) {
-    const err = new Error('mappingType must be "product", "variant", or "size"');
-    err.code = "INVALID_MAPPING_TYPE";
-    throw err;
-  }
-  if (!id) {
-    const err = new Error("entityId is required");
-    err.code = "INVALID_ENTITY_ID";
-    throw err;
-  }
-
-  await getBostaSkuMapping(type, id);
-
-  const { error } = await supabase
-    .from(MAPPINGS_TABLE)
-    .delete()
-    .eq("mapping_type", type)
-    .eq("entity_id", id);
-
-  if (error) {
-    throw new Error(error.message);
-  }
-
-  return { mappingType: type, entityId: id, deleted: true };
+async function deleteBostaSkuMapping(mappingType, entityId, input = {}) {
+  const existing = await getBostaSkuMapping(mappingType, entityId, input);
+  return deleteBostaSkuMappingById(existing.id, input);
 }
 
-async function deleteUnmappedProduct(productId) {
+async function deleteBostaSkuMappingById(mappingId, input = {}) {
+  const existing = await getBostaSkuMappingById(mappingId);
+  if (input.shippingIntegrationId || input.shipping_integration_id) {
+    const shipping = await resolveBostaShippingConnection(
+      pickShippingIntegrationId(input),
+    );
+    if (
+      existing.shipping_integration_id &&
+      String(existing.shipping_integration_id) !== String(shipping.id)
+    ) {
+      const err = new Error("Mapping not found");
+      err.code = "MAPPING_NOT_FOUND";
+      throw err;
+    }
+  }
+
+  const { error } = await supabase.from(MAPPINGS_TABLE).delete().eq("id", existing.id);
+  if (error) throw new Error(error.message);
+  return {
+    mappingType: existing.mapping_type,
+    entityId: existing.entity_id,
+    id: existing.id,
+    deleted: true,
+  };
+}
+
+async function deleteUnmappedProduct(productId, input = {}) {
+  const shipping = await resolveBostaShippingConnection(
+    pickShippingIntegrationId(input),
+    { required: true },
+  );
   const id = String(productId || "").trim();
   if (!id) {
     const err = new Error("productId is required");
@@ -339,128 +505,165 @@ async function deleteUnmappedProduct(productId) {
     throw err;
   }
 
-  const { data, error } = await supabase
-    .from(UNMAPPED_TABLE)
-    .delete()
-    .eq("product_id", id)
-    .select()
-    .maybeSingle();
-
-  if (error) {
-    throw new Error(error.message);
-  }
-  if (!data) {
+  const rows = await fetchUnmappedRows();
+  const hit = rows.find((row) => {
+    if (!isAttributedToShipping(row, shipping.id)) return false;
+    return (
+      String(row.id) === id ||
+      String(row.catalog_product_id) === id ||
+      String(row.product_id) === id
+    );
+  });
+  if (!hit) {
     const err = new Error("Unmapped product not found");
     err.code = "MAPPING_NOT_FOUND";
     throw err;
   }
 
-  return {
-    productId: data.product_id,
-    name: data.name,
-    deleted: true,
-  };
+  const { error } = await supabase.from(UNMAPPED_TABLE).delete().eq("id", hit.id);
+  if (error) throw new Error(error.message);
+  return presentUnmappedRow({ ...hit, deleted: true });
 }
 
-async function replaceUnmappedProducts(unmappedProducts) {
-  await supabase.from(UNMAPPED_TABLE).delete().neq("product_id", "");
+async function replaceUnmappedProductsForShipping(shippingId, unmappedProducts) {
+  const existing = await fetchUnmappedRows();
+  const toDelete = existing.filter((row) =>
+    isAttributedToShipping(row, shippingId),
+  );
+  for (const row of toDelete) {
+    const { error } = await supabase.from(UNMAPPED_TABLE).delete().eq("id", row.id);
+    if (error) throw new Error(error.message);
+  }
 
-  const rows = (unmappedProducts || [])
-    .map((item) => ({
-      product_id: String(item.productId ?? item.product_id ?? "").trim(),
-      name: String(item.name ?? "").trim(),
+  const rows = [];
+  for (const item of unmappedProducts || []) {
+    const catalog = await resolveCatalogProduct({
+      catalogProductId: item.catalogProductId ?? item.catalog_product_id,
+      externalId: item.productId ?? item.product_id ?? item.entityId,
+      sourceIntegrationId:
+        item.sourceIntegrationId ?? item.source_integration_id,
+    });
+    rows.push({
+      shipping_integration_id: shippingId,
+      catalog_product_id: catalog.id,
+      product_id: String(item.productId ?? item.product_id ?? catalog.easyorder_id ?? catalog.id),
+      name: String(item.name ?? catalog.name ?? "").trim(),
       reason: String(item.reason ?? "").trim(),
       updated_at: new Date().toISOString(),
-    }))
-    .filter((row) => row.product_id);
-
-  if (!rows.length) {
-    return [];
+    });
   }
 
-  const { data, error } = await supabase
-    .from(UNMAPPED_TABLE)
-    .upsert(rows, { onConflict: "company_id,product_id" })
-    .select();
-
-  if (error) {
-    throw new Error(error.message);
-  }
-
+  if (!rows.length) return [];
+  const { data, error } = await supabase.from(UNMAPPED_TABLE).insert(rows).select();
+  if (error) throw new Error(error.message);
   return data || [];
 }
 
-async function replaceAllMappingRows() {
-  const { error } = await supabase
-    .from(MAPPINGS_TABLE)
-    .delete()
-    .neq("entity_id", "");
-
-  if (error) {
-    throw new Error(error.message);
-  }
+async function resolveImportCatalogProduct(entityId, entry, defaultSourceId) {
+  return resolveCatalogProduct({
+    catalogProductId: entry?.catalogProductId ?? entry?.catalog_product_id,
+    externalId: entityId,
+    sourceIntegrationId:
+      entry?.sourceIntegrationId ??
+      entry?.source_integration_id ??
+      defaultSourceId,
+  });
 }
 
 async function importBostaSkuMappings(payload) {
+  const shipping = await resolveBostaShippingConnection(
+    pickShippingIntegrationId(payload),
+    { required: true },
+  );
+  const defaultSourceId = String(
+    payload?.sourceIntegrationId ?? payload?.source_integration_id ?? "",
+  ).trim();
+
   const productSkuMap = payload?.productSkuMap || {};
   const variantSkuMap = payload?.variantSkuMap || {};
   const sizeSkuMap = payload?.sizeSkuMap || {};
   const unmappedProducts = payload?.unmappedProducts || [];
 
   const rows = [];
+  const ambiguous = [];
+  const missing = [];
 
-  for (const [entityId, entry] of Object.entries(productSkuMap)) {
-    rows.push({
-      mapping_type: "product",
-      entity_id: entityId,
-      name: entry?.name || "",
-      skus: normalizeSkus(entry?.skus),
-      sizes: null,
-      product_id: null,
-      size: null,
-      updated_at: new Date().toISOString(),
-    });
-  }
-
-  for (const [entityId, entry] of Object.entries(variantSkuMap)) {
-    rows.push({
-      mapping_type: "variant",
-      entity_id: entityId,
-      product_id: entry?.productId ?? entry?.product_id ?? null,
-      name: entry?.name || "",
-      size: entry?.size != null ? String(entry.size) : null,
-      skus: normalizeSkus(entry?.skus),
-      sizes: null,
-      updated_at: new Date().toISOString(),
-    });
-  }
-
-  for (const [entityId, entry] of Object.entries(sizeSkuMap)) {
-    rows.push({
-      mapping_type: "size",
-      entity_id: entityId,
-      name: entry?.name || "",
-      sizes: normalizeSizes(entry?.sizes),
-      skus: [],
-      product_id: null,
-      size: null,
-      updated_at: new Date().toISOString(),
-    });
-  }
-
-  await replaceAllMappingRows();
-
-  if (rows.length) {
-    const { error } = await supabase.from(MAPPINGS_TABLE).insert(rows);
-
-    if (error) {
-      throw new Error(error.message);
+  async function pushResolved(entityId, entry, mappingType) {
+    try {
+      const catalog = await resolveImportCatalogProduct(
+        entityId,
+        entry,
+        defaultSourceId,
+      );
+      const payloadRow = validateMappingPayload({
+        mappingType,
+        catalogProductId: catalog.id,
+        entityId: mappingType === "variant" ? entityId : catalog.id,
+        name: entry?.name || catalog.name || "",
+        skus: entry?.skus,
+        sizes: entry?.sizes,
+        size: entry?.size,
+        productId: catalog.id,
+      });
+      payloadRow.shipping_integration_id = shipping.id;
+      payloadRow.catalog_product_id = catalog.id;
+      if (mappingType !== "variant") payloadRow.entity_id = catalog.id;
+      rows.push(payloadRow);
+    } catch (error) {
+      if (error.code === "CATALOG_PRODUCT_AMBIGUOUS") {
+        ambiguous.push({ entityId, mappingType, message: error.message });
+        return;
+      }
+      if (error.code === "CATALOG_PRODUCT_NOT_FOUND" || error.code === "INVALID_CATALOG_PRODUCT") {
+        missing.push({ entityId, mappingType, message: error.message });
+        return;
+      }
+      throw error;
     }
   }
 
-  await replaceUnmappedProducts(unmappedProducts);
+  for (const [entityId, entry] of Object.entries(productSkuMap)) {
+    await pushResolved(entityId, entry, "product");
+  }
+  for (const [entityId, entry] of Object.entries(variantSkuMap)) {
+    await pushResolved(entityId, entry, "variant");
+  }
+  for (const [entityId, entry] of Object.entries(sizeSkuMap)) {
+    await pushResolved(entityId, entry, "size");
+  }
 
-  return getBostaSkuMappings();
+  if (ambiguous.length) {
+    const err = new Error(
+      "Import has external product ids that match multiple catalog products",
+    );
+    err.code = "IMPORT_PRODUCT_AMBIGUOUS";
+    err.ambiguous = ambiguous;
+    throw err;
+  }
+  if (missing.length && !rows.length && !unmappedProducts.length) {
+    const err = new Error("No import rows could be resolved to catalog products");
+    err.code = "CATALOG_PRODUCT_NOT_FOUND";
+    err.missing = missing;
+    throw err;
+  }
+
+  const existing = await fetchAllMappingRows();
+  const toDelete = existing.filter((row) =>
+    isAttributedToShipping(row, shipping.id),
+  );
+  for (const row of toDelete) {
+    const { error } = await supabase.from(MAPPINGS_TABLE).delete().eq("id", row.id);
+    if (error) throw new Error(error.message);
+  }
+
+  if (rows.length) {
+    const { error } = await supabase.from(MAPPINGS_TABLE).insert(rows);
+    if (error) throw new Error(error.message);
+  }
+
+  await replaceUnmappedProductsForShipping(shipping.id, unmappedProducts);
+
+  return getBostaSkuMappings({ shippingIntegrationId: shipping.id });
 }
 
 function pickLineProductId(line) {
@@ -816,22 +1019,29 @@ function normalizeSizeKey(value) {
 
 function resolveMappedSkuCandidatesForLine(line, maps) {
   const variantId = pickLineVariantId(line);
-  const productId = pickLineProductId(line);
+  const catalogId = String(
+    line?._catalogProductId ??
+      line?.catalogProductId ??
+      line?.catalog_product_id ??
+      "",
+  ).trim();
   const size = pickLineSize(line);
   const normalizedSize = normalizeSizeKey(size);
+  const variantByCatalog = maps.variantByCatalog || {};
 
-  if (variantId && maps.variantSkuMap[variantId]) {
-    const entry = maps.variantSkuMap[variantId];
+  if (catalogId && variantId && variantByCatalog[catalogId]?.[variantId]) {
+    const entry = variantByCatalog[catalogId][variantId];
     return {
       productName: pickLineDisplayName(line, entry.name),
       skus: normalizeSkus(entry.skus),
       mappingType: "variant",
       entityId: variantId,
+      catalogProductId: catalogId,
     };
   }
 
-  if (productId && maps.sizeSkuMap[productId]) {
-    const entry = maps.sizeSkuMap[productId];
+  if (catalogId && maps.sizeSkuMap[catalogId]) {
+    const entry = maps.sizeSkuMap[catalogId];
     const sizes = entry.sizes || {};
 
     if (normalizedSize && sizes[normalizedSize]) {
@@ -839,7 +1049,8 @@ function resolveMappedSkuCandidatesForLine(line, maps) {
         productName: pickLineDisplayName(line, entry.name),
         skus: normalizeSkus(sizes[normalizedSize]),
         mappingType: "size",
-        entityId: productId,
+        entityId: catalogId,
+        catalogProductId: catalogId,
         size: normalizedSize,
       };
     }
@@ -854,7 +1065,8 @@ function resolveMappedSkuCandidatesForLine(line, maps) {
             productName: pickLineDisplayName(line, entry.name),
             skus: normalizeSkus(skus),
             mappingType: "size",
-            entityId: productId,
+            entityId: catalogId,
+            catalogProductId: catalogId,
             size: sizeKey,
           };
         }
@@ -862,13 +1074,14 @@ function resolveMappedSkuCandidatesForLine(line, maps) {
     }
   }
 
-  if (productId && maps.productSkuMap[productId]) {
-    const entry = maps.productSkuMap[productId];
+  if (catalogId && maps.productSkuMap[catalogId]) {
+    const entry = maps.productSkuMap[catalogId];
     return {
       productName: pickLineDisplayName(line, entry.name),
       skus: normalizeSkus(entry.skus),
       mappingType: "product",
-      entityId: productId,
+      entityId: catalogId,
+      catalogProductId: catalogId,
     };
   }
 
@@ -887,7 +1100,7 @@ function resolveMappedSkuCandidatesForLine(line, maps) {
       line.product_sku,
     ]),
     mappingType: null,
-    entityId: productId || variantId || null,
+    entityId: catalogId || variantId || pickLineProductId(line) || null,
   };
 }
 
@@ -930,7 +1143,12 @@ async function resolveMappedBostaSkuForLine(
   maps = null,
   inventoryMap = null,
 ) {
-  const data = maps || (await getBostaSkuMappings());
+  const shipping = getActiveIntegration();
+  const data =
+    maps ||
+    (await loadAttributedMapsForShipping(
+      shipping?.id || (await resolveBostaShippingConnection()).id,
+    ));
   const inventory =
     inventoryMap || (await require("./bostaFulfillment.service").fetchBostaInventoryAvailabilityMap());
 
@@ -969,13 +1187,20 @@ async function validateOrderLinesInventory(localOrder) {
   const cartLines = Array.isArray(localOrder?.cart_items ?? localOrder?.cartItems)
     ? (localOrder.cart_items ?? localOrder.cartItems)
     : [];
+  const shipping = getActiveIntegration() || (await resolveBostaShippingConnection());
+  const sourceIntegrationId =
+    localOrder?.source_integration_id ?? localOrder?.sourceIntegrationId ?? null;
 
   if (!cartLines.length) {
-    return { items: [], inventoryMap: new Map(), maps: await getBostaSkuMappings() };
+    return {
+      items: [],
+      inventoryMap: new Map(),
+      maps: await loadAttributedMapsForShipping(shipping.id),
+    };
   }
 
   const [maps, inventoryMap] = await Promise.all([
-    getBostaSkuMappings(),
+    loadAttributedMapsForShipping(shipping.id),
     fetchBostaInventoryAvailabilityMap(),
   ]);
 
@@ -984,6 +1209,9 @@ async function validateOrderLinesInventory(localOrder) {
 
   for (let index = 0; index < cartLines.length; index += 1) {
     const line = cartLines[index];
+    const catalog = await resolveLineCatalogProduct(line, sourceIntegrationId);
+    line._catalogProductId = catalog.id;
+    line.catalogProductId = catalog.id;
     const requiredQty = Math.max(1, Number(line?.quantity) || 1);
     const lineResult = resolveLineSkuForBosta(line, maps, inventoryMap, requiredQty);
 
@@ -1021,6 +1249,15 @@ async function validateOrderLinesInventory(localOrder) {
 function buildSkusWithInventory(skus, inventoryDetailsMap, requiredQuantity = 1) {
   const qtyNeeded = Math.max(1, Number(requiredQuantity) || 1);
   return normalizeSkus(skus).map((skuCode) => {
+    if (!inventoryDetailsMap) {
+      return {
+        skuCode,
+        name: "",
+        availableQuantity: null,
+        inStock: true,
+        inventoryKnown: false,
+      };
+    }
     const info = inventoryDetailsMap.get(skuCode);
     const availableQuantity = Number(info?.availableQuantity || 0);
     return {
@@ -1028,6 +1265,7 @@ function buildSkusWithInventory(skus, inventoryDetailsMap, requiredQuantity = 1)
       name: info?.name || "",
       availableQuantity,
       inStock: availableQuantity >= qtyNeeded,
+      inventoryKnown: true,
     };
   });
 }
@@ -1049,7 +1287,8 @@ function buildOptionBase(row, inventoryDetailsMap, requiredQuantity, extra = {})
   return {
     mappingType: row.mapping_type,
     entityId: row.entity_id,
-    productId: row.product_id || row.entity_id,
+    catalogProductId: row.catalog_product_id || null,
+    productId: row.catalog_product_id || row.product_id || row.entity_id,
     name: mappingName,
     label: mappingName,
     size: row.size || null,
@@ -1076,7 +1315,8 @@ function buildOptionsFromSizeRow(row, inventoryDetailsMap, requiredQuantity) {
     return {
       mappingType: "size",
       entityId: row.entity_id,
-      productId: row.entity_id,
+      catalogProductId: row.catalog_product_id || null,
+      productId: row.catalog_product_id || row.entity_id,
       name: mappingName,
       label: mappingName,
       size: sizeKey,
@@ -1089,65 +1329,57 @@ function buildOptionsFromSizeRow(row, inventoryDetailsMap, requiredQuantity) {
   });
 }
 
-async function fetchMappingRowsForProduct(productId) {
-  const id = String(productId || "").trim();
-
-  const [productRes, variantRes, sizeRes, unmappedRes] = await Promise.all([
-    supabase
-      .from(MAPPINGS_TABLE)
-      .select("*")
-      .eq("mapping_type", "product")
-      .eq("entity_id", id)
-      .maybeSingle(),
-    supabase
-      .from(MAPPINGS_TABLE)
-      .select("*")
-      .eq("mapping_type", "variant")
-      .eq("product_id", id)
-      .order("name", { ascending: true }),
-    supabase
-      .from(MAPPINGS_TABLE)
-      .select("*")
-      .eq("mapping_type", "size")
-      .eq("entity_id", id)
-      .maybeSingle(),
-    supabase
-      .from(UNMAPPED_TABLE)
-      .select("*")
-      .eq("product_id", id)
-      .maybeSingle(),
+async function fetchMappingRowsForProduct(catalogProductId, shippingId) {
+  const [mappingRows, unmappedRows] = await Promise.all([
+    fetchAllMappingRows(),
+    fetchUnmappedRows(),
   ]);
-
-  for (const res of [productRes, variantRes, sizeRes, unmappedRes]) {
-    if (res.error) {
-      throw new Error(res.error.message);
-    }
-  }
+  const attributed = mappingRows.filter(
+    (row) =>
+      isAttributedToShipping(row, shippingId) &&
+      String(row.catalog_product_id) === String(catalogProductId),
+  );
+  const unmapped =
+    unmappedRows.find(
+      (row) =>
+        isAttributedToShipping(row, shippingId) &&
+        String(row.catalog_product_id) === String(catalogProductId),
+    ) || null;
 
   return {
-    product: productRes.data || null,
-    variants: variantRes.data || [],
-    size: sizeRes.data || null,
-    unmapped: unmappedRes.data || null,
+    product:
+      attributed.find((row) => row.mapping_type === "product") || null,
+    variants: attributed.filter((row) => row.mapping_type === "variant"),
+    size: attributed.find((row) => row.mapping_type === "size") || null,
+    unmapped,
   };
 }
 
 /**
- * Product id (EasyOrder) → Bosta mapping options + live inventory per sku.
- * User picks variant/option and optional skuCode when sending to Bosta.
+ * Catalog product UUID + selected Bosta account → mapping options + inventory.
  */
 async function getBostaSkuOptionsForProduct(productId, options = {}) {
-  const id = String(productId || "").trim();
-  if (!id) {
-    const err = new Error("productId is required");
-    err.code = "INVALID_PRODUCT_ID";
-    throw err;
-  }
+  const shipping = await resolveBostaShippingConnection(
+    options.shippingIntegrationId || pickShippingIntegrationId(options),
+  );
+  const catalog = await resolveCatalogProduct({
+    catalogProductId: productId,
+    externalId: productId,
+    sourceIntegrationId: options.sourceIntegrationId,
+  });
+  const id = catalog.id;
 
   const requiredQuantity = Math.max(1, Number(options.requiredQuantity) || 1);
-  const rows = await fetchMappingRowsForProduct(id);
-  const { fetchBostaInventoryDetailsMap } = require("./bostaFulfillment.service");
-  const inventoryDetailsMap = await fetchBostaInventoryDetailsMap();
+  const rows = await fetchMappingRowsForProduct(id, shipping.id);
+  const includeInventory = options.includeInventory === true;
+  let inventoryDetailsMap = null;
+  if (includeInventory) {
+    const { fetchBostaInventoryDetailsMap } = require("./bostaFulfillment.service");
+    const { runWithIntegration } = require("../utils/tenantScope");
+    inventoryDetailsMap = await runWithIntegration(shipping, () =>
+      fetchBostaInventoryDetailsMap(),
+    );
+  }
 
   const mappingOptions = [];
 
@@ -1177,9 +1409,12 @@ async function getBostaSkuOptionsForProduct(productId, options = {}) {
     );
     err.code = rows.unmapped ? "PRODUCT_UNMAPPED" : "PRODUCT_NOT_MAPPED";
     err.productId = id;
+    err.catalogProductId = id;
+    err.shippingIntegrationId = shipping.id;
     if (rows.unmapped) {
       err.unmapped = {
         productId: id,
+        catalogProductId: id,
         name: rows.unmapped.name || "",
         reason: rows.unmapped.reason || "",
       };
@@ -1200,7 +1435,9 @@ async function getBostaSkuOptionsForProduct(productId, options = {}) {
 
   return {
     productId: id,
-    productName,
+    catalogProductId: id,
+    shippingIntegrationId: shipping.id,
+    productName: productName || catalog.name || "",
     requiredQuantity,
     options: mappingOptions,
     summary: {
@@ -1215,12 +1452,17 @@ module.exports = {
   MAPPING_TYPES,
   getBostaSkuMappings,
   getBostaSkuMapping,
+  getBostaSkuMappingById,
   addBostaSkuMapping,
   updateBostaSkuMapping,
+  updateBostaSkuMappingById,
   deleteBostaSkuMapping,
+  deleteBostaSkuMappingById,
   deleteUnmappedProduct,
   importBostaSkuMappings,
   getBostaSkuOptionsForProduct,
+  presentMappingRow,
+  presentUnmappedRow,
   pickLineSelectedBostaSku,
   parseLineSkuOverrides,
   applyLineSkuOverridesToOrder,

@@ -1,4 +1,5 @@
 const { getPublicCompanyBranding } = require("../services/publicBranding.service");
+const { sendInternalError } = require("../utils/safeError");
 
 async function getCompanyBranding(req, res) {
   try {
@@ -13,11 +14,7 @@ async function getCompanyBranding(req, res) {
       });
       return;
     }
-    res.status(500).json({
-      success: false,
-      message: "Failed to load company branding",
-      error: error.message,
-    });
+    sendInternalError(res, "Failed to load company branding", error, "branding");
   }
 }
 

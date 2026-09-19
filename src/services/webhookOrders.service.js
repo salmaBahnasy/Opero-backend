@@ -14,6 +14,38 @@ const {
   allocateNextOrderReference,
 } = require("../utils/orderReference");
 const { normalizePaymentMethod } = require("../utils/paymentMethod");
+const {
+  clampListLimit,
+  DEFAULT_LIST_LIMIT,
+  MAX_LIST_LIMIT,
+} = require("../utils/listPagination");
+
+const ORDERS_LIST_SELECT = [
+  "id",
+  "order_id",
+  "order_reference",
+  "status",
+  "customer_status",
+  "customer_name",
+  "customer_phone",
+  "customer_phone_2",
+  "order_source",
+  "order_type",
+  "shipping_status",
+  "ingestion_source",
+  "is_manual",
+  "assigned_employee_id",
+  "bosta_order_id",
+  "bosta_order_alias",
+  "bosta_tracking_number",
+  "total_amount",
+  "payment_method",
+  "source_integration_id",
+  "shipping_integration_id",
+  "created_at",
+  "updated_at",
+  "raw_data",
+].join(",");
 
 const ALLOWED_ORDER_STATUSES = [
   "canceled",
@@ -577,6 +609,7 @@ async function collectOrderIdsUnionIlikePaths({
 }
 
 const CUSTOMER_NAME_ILIKE_PATHS = [
+  "customer_name",
   "raw_data->>full_name",
   "raw_data->>fullName",
   "raw_data->>customer_name",
@@ -686,7 +719,7 @@ async function fetchOrdersPageByMembershipChunks(
 
   const { data, error } = await supabase
     .from(ORDERS_TABLE)
-    .select("*")
+    .select(ORDERS_LIST_SELECT)
     .in("order_id", pageIds);
   if (error) {
     throw formatSupabaseError(error);
@@ -1145,8 +1178,116 @@ async function resolveEmployeeScopedOrderIds({
   };
 }
 
+function orderAmbiguousError() {
+  const err = new Error(
+    "Multiple local orders match this order id. Qualify the request with source_integration_id.",
+  );
+  err.code = "ORDER_AMBIGUOUS";
+  return err;
+}
+
+function orderNotFoundError() {
+  const err = new Error("Order not found");
+  err.code = "ORDER_NOT_FOUND";
+  return err;
+}
+
+function orderDuplicateError() {
+  const err = new Error("A manual order with this order id already exists");
+  err.code = "ORDER_DUPLICATE";
+  return err;
+}
+
+const LOCAL_ORDER_UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function looksLikeLocalOrderUuid(value) {
+  return LOCAL_ORDER_UUID_RE.test(String(value || "").trim());
+}
+
+function normalizeSourceIntegrationId(value) {
+  if (value == null) return null;
+  const id = String(value).trim();
+  if (!id || id === "null" || id === "undefined") return null;
+  return id;
+}
+
+function orderIdentityOptionsFrom(req = {}) {
+  const source =
+    req.query?.source_integration_id ??
+    req.query?.sourceIntegrationId ??
+    req.body?.source_integration_id ??
+    req.body?.sourceIntegrationId;
+  const options = {};
+  const sourceId = normalizeSourceIntegrationId(source);
+  if (sourceId) options.sourceIntegrationId = sourceId;
+  const manual = req.query?.manualOnly ?? req.query?.manual_only;
+  if (manual === true || String(manual || "").toLowerCase() === "true") {
+    options.manualOnly = true;
+  }
+  return options;
+}
+
+function pickOrderRow(rows, { sourceIntegrationId, manualOnly } = {}) {
+  const list = Array.isArray(rows) ? rows : [];
+  const sourceId = normalizeSourceIntegrationId(sourceIntegrationId);
+  let matched = list;
+  if (sourceId) {
+    matched = list.filter(
+      (row) => String(row.source_integration_id || "") === sourceId,
+    );
+  } else if (manualOnly) {
+    matched = list.filter((row) => row.source_integration_id == null);
+  }
+
+  if (!matched.length) return null;
+  if (matched.length > 1) throw orderAmbiguousError();
+  return matched[0];
+}
+
+async function fetchOrderRowByLocalId(localId) {
+  const id = String(localId || "").trim();
+  if (!id) return null;
+  const { data, error } = await supabase
+    .from(ORDERS_TABLE)
+    .select("*")
+    .eq("id", id)
+    .maybeSingle();
+  if (error) throw new Error(error.message);
+  return data || null;
+}
+
+async function fetchOrderRowsByExternalId(externalId) {
+  const id = String(externalId || "").trim();
+  if (!id) return [];
+  const { data, error } = await supabase
+    .from(ORDERS_TABLE)
+    .select("*")
+    .eq("order_id", id);
+  if (error) throw new Error(error.message);
+  return data || [];
+}
+
+async function resolveStoredOrderRow(orderId, options = {}) {
+  const id = String(orderId || "").trim();
+  if (!id) {
+    const err = new Error("order id is required");
+    err.code = "INVALID_ORDER_ID";
+    throw err;
+  }
+
+  const byLocalId = await fetchOrderRowByLocalId(id);
+  if (byLocalId) return byLocalId;
+
+  const rows = await fetchOrderRowsByExternalId(id);
+  const row = pickOrderRow(rows, options);
+  if (!row) throw orderNotFoundError();
+  return row;
+}
+
 async function insertOrderStatusLog({
   orderId,
+  orderUuid,
   oldStatus,
   newStatus,
   changedBy,
@@ -1165,13 +1306,13 @@ async function insertOrderStatusLog({
   }
 
   try {
-    const { data: orderRow } = await supabase
-      .from(ORDERS_TABLE)
-      .select("id")
-      .eq("order_id", orderId)
-      .maybeSingle();
-    if (orderRow?.id) {
-      payload.order_uuid = orderRow.id;
+    if (orderUuid) {
+      payload.order_uuid = orderUuid;
+    } else {
+      const rows = await fetchOrderRowsByExternalId(orderId);
+      if (rows.length === 1 && rows[0]?.id) {
+        payload.order_uuid = rows[0].id;
+      }
     }
   } catch {
     // Keep external order_id even if the uuid lookup fails.
@@ -1222,23 +1363,17 @@ async function hasOrderReferenceColumn() {
   return orderReferenceColumnAvailable;
 }
 
-async function fetchOrderRowBySourceId(orderId) {
+async function fetchOrderRowBySourceId(orderId, options = {}) {
   const id = String(orderId || "").trim();
   if (!id) return null;
-  const useRefCol = await hasOrderReferenceColumn();
-  const { data, error } = await supabase
-    .from(ORDERS_TABLE)
-    .select(
-      useRefCol
-        ? "order_id, order_reference, raw_data, created_at, status"
-        : "order_id, raw_data, created_at, status",
-    )
-    .eq("order_id", id)
-    .maybeSingle();
-  if (error) {
-    throw new Error(error.message);
+  try {
+    return await resolveStoredOrderRow(id, options);
+  } catch (error) {
+    if (error.code === "ORDER_NOT_FOUND" || error.code === "INVALID_ORDER_ID") {
+      return null;
+    }
+    throw error;
   }
-  return data;
 }
 
 function mapStoredOrderToClient(row) {
@@ -1253,6 +1388,10 @@ function mapStoredOrderToClient(row) {
   syncCustomerStatusAliases(raw);
   return {
     ...raw,
+    id: row.id,
+    localOrderId: row.id,
+    orderRowId: row.id,
+    order_id: row.order_id,
     sourceOrderId: row.order_id,
     status: row.status,
     orderStatus: row.status,
@@ -1272,6 +1411,133 @@ function mapStoredOrderToClient(row) {
     confirmation_updated_at:
       raw.confirmation_updated_at ?? raw.confirmationUpdatedAt ?? null,
     receivedAt: row.created_at,
+    ...(ref != null
+      ? {
+          order_reference: ref,
+          orderReference: ref,
+        }
+      : {}),
+  };
+}
+
+function firstRawText(raw, ...keys) {
+  if (!raw || typeof raw !== "object") return "";
+  for (const key of keys) {
+    const text = String(raw[key] ?? "").trim();
+    if (text) return text;
+  }
+  return "";
+}
+
+function slimCartItemsFromRaw(raw) {
+  const items = Array.isArray(raw?.cart_items)
+    ? raw.cart_items
+    : Array.isArray(raw?.cartItems)
+      ? raw.cartItems
+      : [];
+  return items.slice(0, 20).map((item) => {
+    const product = item?.product && typeof item.product === "object" ? item.product : {};
+    const variant = item?.variant && typeof item.variant === "object" ? item.variant : {};
+    const qty = Number(item?.quantity ?? item?.qty);
+    return {
+      name: String(
+        item?.name ||
+          item?.product_name ||
+          item?.title ||
+          product.name ||
+          "",
+      ).trim(),
+      quantity: Number.isFinite(qty) && qty > 0 ? qty : 1,
+      sku: String(item?.sku || product.sku || variant.sku || "").trim(),
+      variation_prop: String(
+        item?.variation_prop ||
+          variant.size ||
+          item?.size ||
+          "",
+      ).trim(),
+    };
+  });
+}
+
+function mapStoredOrderToListClient(row) {
+  const ref = readOrderReferenceFromRow(row);
+  const raw =
+    row.raw_data && typeof row.raw_data === "object" && !Array.isArray(row.raw_data)
+      ? row.raw_data
+      : {};
+  const customerName =
+    String(row.customer_name || "").trim() ||
+    firstRawText(raw, "full_name", "fullName", "customer_name", "customerName");
+  const phone =
+    String(row.customer_phone || "").trim() ||
+    firstRawText(raw, "phone", "mobile", "customer_phone");
+  const phone2 =
+    String(row.customer_phone_2 || "").trim() ||
+    firstRawText(raw, "phone2", "phone_2", "secondaryPhone", "secondary_phone");
+  const customerStatus =
+    String(row.customer_status || "").trim() ||
+    firstRawText(raw, "customer_status", "customerStatus");
+  const shippingStatus =
+    String(row.shipping_status || "").trim() ||
+    firstRawText(raw, "shipping_status", "shippingStatus");
+  const noteText = firstRawText(raw, "note", "notes");
+  const updatedBy =
+    firstRawText(raw, "updated_by_name", "updatedByName", "user_name") ||
+    (raw.updated_by && typeof raw.updated_by === "object"
+      ? String(raw.updated_by.name || "").trim()
+      : "");
+
+  return {
+    id: row.id,
+    localOrderId: row.id,
+    orderRowId: row.id,
+    order_id: row.order_id,
+    sourceOrderId: row.order_id,
+    status: row.status,
+    orderStatus: row.status,
+    customer_status: customerStatus || null,
+    customerStatus: customerStatus || null,
+    customer_name: customerName || null,
+    full_name: customerName || null,
+    phone: phone || null,
+    mobile: phone || null,
+    customer_phone: phone || null,
+    phone2: phone2 || null,
+    customer_phone_2: phone2 || null,
+    order_source:
+      row.order_source ??
+      (firstRawText(raw, "order_source", "orderSource") || null),
+    order_type:
+      row.order_type ?? (firstRawText(raw, "order_type", "orderType") || null),
+    shipping_status: shippingStatus || null,
+    shippingStatus: shippingStatus || null,
+    ingestion_source: row.ingestion_source ?? null,
+    is_manual: Boolean(row.is_manual ?? raw.is_manual ?? raw.isManual),
+    isManual: Boolean(row.is_manual ?? raw.is_manual ?? raw.isManual),
+    assigned_employee_id: row.assigned_employee_id ?? null,
+    bosta_order_id: row.bosta_order_id || firstRawText(raw, "bosta_order_id") || null,
+    bosta_order_alias: row.bosta_order_alias || firstRawText(raw, "bosta_order_alias", "orderAlias") || null,
+    bosta_tracking_number: row.bosta_tracking_number || null,
+    bosta_status: firstRawText(raw, "bosta_status", "bostaStatus") || null,
+    total_amount: row.total_amount ?? null,
+    payment_method: row.payment_method || firstRawText(raw, "payment_method") || null,
+    source_integration_id: row.source_integration_id ?? raw.source_integration_id ?? null,
+    sourceIntegrationId: row.source_integration_id ?? raw.sourceIntegrationId ?? null,
+    shipping_integration_id:
+      row.shipping_integration_id ?? raw.shipping_integration_id ?? null,
+    shippingIntegrationId:
+      row.shipping_integration_id ?? raw.shippingIntegrationId ?? null,
+    receivedAt: row.created_at,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+    updated_by_name: updatedBy || null,
+    updatedByName: updatedBy || null,
+    note: noteText || null,
+    has_note: Boolean(noteText),
+    cart_items: slimCartItemsFromRaw(raw),
+    address: firstRawText(raw, "address", "firstLine", "first_line"),
+    city: firstRawText(raw, "city", "government", "governorate"),
+    district: firstRawText(raw, "district", "area"),
     ...(ref != null
       ? {
           order_reference: ref,
@@ -1336,20 +1602,27 @@ async function getWebhookOrderByReference(orderReferenceInput) {
   return mapStoredOrderToClient(rows[0]);
 }
 
-async function getWebhookOrderById(orderId) {
-  const id = String(orderId || "").trim();
-  if (!id) {
-    const err = new Error("order id is required");
-    err.code = "INVALID_ORDER_ID";
-    throw err;
-  }
-  const row = await fetchOrderRowBySourceId(id);
-  if (!row) {
-    const notFound = new Error("Order not found");
-    notFound.code = "ORDER_NOT_FOUND";
-    throw notFound;
-  }
+async function getWebhookOrderById(orderId, options = {}) {
+  const row = await resolveStoredOrderRow(orderId, options);
   return mapStoredOrderToClient(row);
+}
+
+async function findOrderRowsByBostaAliasFields(alias) {
+  const escaped = String(alias || "")
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"');
+  const { data: rows, error } = await supabase
+    .from(ORDERS_TABLE)
+    .select("*")
+    .or(
+      [
+        `raw_data->>bosta_order_alias.eq.${escaped}`,
+        `raw_data->>orderAlias.eq.${escaped}`,
+      ].join(","),
+    )
+    .limit(2);
+  if (error) throw new Error(error.message);
+  return rows || [];
 }
 
 async function findOrderByBostaAlias(orderAlias) {
@@ -1360,10 +1633,11 @@ async function findOrderByBostaAlias(orderAlias) {
     throw err;
   }
 
-  const byIdRow = await fetchOrderRowBySourceId(alias);
-  if (byIdRow) {
-    return mapStoredOrderToClient(byIdRow);
+  const aliasRows = await findOrderRowsByBostaAliasFields(alias);
+  if (aliasRows.length === 1) {
+    return mapStoredOrderToClient(aliasRows[0]);
   }
+  if (aliasRows.length > 1) throw orderAmbiguousError();
 
   if (/^\d+$/.test(alias)) {
     try {
@@ -1378,33 +1652,12 @@ async function findOrderByBostaAlias(orderAlias) {
     }
   }
 
-  const escaped = alias.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-  const { data: rows, error } = await supabase
-    .from(ORDERS_TABLE)
-    .select("*")
-    .or(
-      [
-        `raw_data->>bosta_order_alias.eq.${escaped}`,
-        `raw_data->>orderAlias.eq.${escaped}`,
-      ].join(","),
-    )
-    .limit(2);
-
-  if (error) {
-    throw new Error(error.message);
-  }
-  if (!rows?.length) {
-    const notFound = new Error("Order not found");
-    notFound.code = "ORDER_NOT_FOUND";
-    throw notFound;
-  }
-  if (rows.length > 1) {
-    const ambiguous = new Error("Multiple orders match this orderAlias");
-    ambiguous.code = "ORDER_REFERENCE_AMBIGUOUS";
-    throw ambiguous;
+  const byExternal = await fetchOrderRowBySourceId(alias);
+  if (byExternal) {
+    return mapStoredOrderToClient(byExternal);
   }
 
-  return mapStoredOrderToClient(rows[0]);
+  throw orderNotFoundError();
 }
 
 async function findOrderByBostaOrderId(bostaOrderId) {
@@ -1428,9 +1681,7 @@ async function findOrderByBostaOrderId(bostaOrderId) {
   }
   if (!rows?.length) return null;
   if (rows.length > 1) {
-    const ambiguous = new Error("Multiple orders match this Bosta order id");
-    ambiguous.code = "ORDER_REFERENCE_AMBIGUOUS";
-    throw ambiguous;
+    throw orderAmbiguousError();
   }
 
   return mapStoredOrderToClient(rows[0]);
@@ -1442,6 +1693,7 @@ async function findOrderForBostaWebhook(payload) {
     try {
       return await findOrderByBostaAlias(alias);
     } catch (error) {
+      if (error.code === "ORDER_AMBIGUOUS") throw error;
       if (
         error.code !== "ORDER_NOT_FOUND" &&
         error.code !== "ORDER_REFERENCE_AMBIGUOUS"
@@ -1457,6 +1709,8 @@ async function findOrderForBostaWebhook(payload) {
   if (bostaId) {
     const order = await findOrderByBostaOrderId(bostaId);
     if (order) return order;
+    const byExternal = await fetchOrderRowBySourceId(bostaId);
+    if (byExternal) return mapStoredOrderToClient(byExternal);
   }
 
   const notFound = new Error("Order not found");
@@ -1465,24 +1719,7 @@ async function findOrderForBostaWebhook(payload) {
 }
 
 async function mergeOrderRawDataPatch(orderId, rawPatch, options = {}) {
-  const id = String(orderId || "").trim();
-  if (!id) {
-    const err = new Error("order id is required");
-    err.code = "INVALID_ORDER_ID";
-    throw err;
-  }
-
-  const { data: existingOrder, error: existingError } = await supabase
-    .from(ORDERS_TABLE)
-    .select("order_id,status,raw_data,created_at")
-    .eq("order_id", id)
-    .single();
-
-  if (existingError || !existingOrder) {
-    const notFound = new Error("Order not found");
-    notFound.code = "ORDER_NOT_FOUND";
-    throw notFound;
-  }
+  const existingOrder = await resolveStoredOrderRow(orderId, options);
 
   const mergedRawData = {
     ...(existingOrder.raw_data || {}),
@@ -1499,19 +1736,25 @@ async function mergeOrderRawDataPatch(orderId, rawPatch, options = {}) {
     nextStatus = options.status;
   }
 
+  const updatePayload = {
+    raw_data: mergedRawData,
+    status: nextStatus,
+  };
+  if (options.shippingIntegrationId) {
+    updatePayload.shipping_integration_id = options.shippingIntegrationId;
+  }
+
   const { data, error } = await supabase
     .from(ORDERS_TABLE)
-    .update({
-      raw_data: mergedRawData,
-      status: nextStatus,
-    })
-    .eq("order_id", id)
+    .update(updatePayload)
+    .eq("id", existingOrder.id)
     .select()
     .single();
 
   if (error) {
     console.error("[orders] mergeOrderRawDataPatch Supabase error", {
-      orderId: id,
+      orderId: existingOrder.order_id,
+      localOrderId: existingOrder.id,
       message: error.message,
       code: error.code,
       details: error.details,
@@ -1526,7 +1769,8 @@ async function mergeOrderRawDataPatch(orderId, rawPatch, options = {}) {
 
   if (!data) {
     console.error("[orders] mergeOrderRawDataPatch returned no data", {
-      orderId: id,
+      orderId: existingOrder.order_id,
+      localOrderId: existingOrder.id,
     });
     throw new Error("Failed to update order: no data returned");
   }
@@ -1534,7 +1778,7 @@ async function mergeOrderRawDataPatch(orderId, rawPatch, options = {}) {
   return mapStoredOrderToClient(data);
 }
 
-async function markOrderSentToBosta(orderId, bostaResult, bostaPayload) {
+async function markOrderSentToBosta(orderId, bostaResult, bostaPayload, options = {}) {
   const bostaId =
     bostaResult?.id ??
     bostaResult?.data?.id ??
@@ -1551,8 +1795,13 @@ async function markOrderSentToBosta(orderId, bostaResult, bostaPayload) {
       bosta_last_payload: bostaPayload ?? null,
       shipping_status: "in_progress",
       shippingStatus: "in_progress",
+      shipping_integration_id: options.shippingIntegrationId || undefined,
+      shippingIntegrationId: options.shippingIntegrationId || undefined,
     },
-    { status: "Shipped" },
+    {
+      status: "Shipped",
+      shippingIntegrationId: options.shippingIntegrationId || undefined,
+    },
   );
 }
 
@@ -1603,12 +1852,29 @@ function mapBostaStatusToOrderStatus(status) {
 
 async function applyBostaFulfillmentWebhook(payload, options = {}) {
   const order = await findOrderForBostaWebhook(payload);
+  const existingShippingId = String(
+    order.shipping_integration_id ?? order.shippingIntegrationId ?? "",
+  ).trim();
+  const webhookShippingId = String(options.shippingIntegrationId || "").trim();
+  if (
+    existingShippingId &&
+    webhookShippingId &&
+    existingShippingId !== webhookShippingId
+  ) {
+    const err = new Error(
+      "Webhook shipping connection does not match this order's Bosta account",
+    );
+    err.code = "SHIPPING_INTEGRATION_MISMATCH";
+    throw err;
+  }
+
   const shippingStatus = mapBostaStatusToShippingStatus(payload?.status);
   const nextOrderStatus = mapBostaStatusToOrderStatus(payload?.status);
   const previousStatus = order.status;
 
+  const persistId = order.localOrderId || order.orderRowId;
   const updatedOrder = await mergeOrderRawDataPatch(
-    order.sourceOrderId,
+    persistId,
     {
       bosta_order_id: payload?.id ?? null,
       bosta_status: payload?.status ?? null,
@@ -1623,17 +1889,18 @@ async function applyBostaFulfillmentWebhook(payload, options = {}) {
     nextOrderStatus ? { status: nextOrderStatus } : {},
   );
 
-  if (options.shippingIntegrationId) {
+  if (webhookShippingId && !existingShippingId) {
     await supabase
       .from(ORDERS_TABLE)
-      .update({ shipping_integration_id: options.shippingIntegrationId })
-      .eq("order_id", order.sourceOrderId);
+      .update({ shipping_integration_id: webhookShippingId })
+      .eq("id", persistId);
   }
 
   if (nextOrderStatus && previousStatus !== nextOrderStatus) {
     try {
       await insertOrderStatusLog({
         orderId: order.sourceOrderId,
+        orderUuid: persistId,
         oldStatus: previousStatus,
         newStatus: nextOrderStatus,
         changedBy: "bosta_webhook",
@@ -1647,8 +1914,20 @@ async function applyBostaFulfillmentWebhook(payload, options = {}) {
 }
 
 async function addWebhookOrder(order, options = {}) {
-  const { fromWebhook, actor, sourceIntegrationId } = options;
+  const { fromWebhook, actor } = options;
+  const { getActiveIntegration } = require("../utils/tenantScope");
   const sourceOrderId = resolveSourceOrderId(order);
+  const attributedSourceId = fromWebhook
+    ? normalizeSourceIntegrationId(options.sourceIntegrationId) ||
+      normalizeSourceIntegrationId(getActiveIntegration()?.id)
+    : null;
+  if (fromWebhook && !attributedSourceId) {
+    const err = new Error(
+      "Webhook orders require a resolved commerce connection",
+    );
+    err.code = "INTEGRATION_NOT_FOUND";
+    throw err;
+  }
   const meta = resolveOrderMeta(order, { fromWebhook });
   const raw_data = {
     ...(order && typeof order === "object" && !Array.isArray(order)
@@ -1678,7 +1957,14 @@ async function addWebhookOrder(order, options = {}) {
     }
   }
 
-  const existingRow = await fetchOrderRowBySourceId(sourceOrderId);
+  const identityRows = await fetchOrderRowsByExternalId(sourceOrderId);
+  const existingRow = pickOrderRow(identityRows, fromWebhook
+    ? { sourceIntegrationId: attributedSourceId }
+    : { manualOnly: true });
+
+  if (!fromWebhook && existingRow) {
+    throw orderDuplicateError();
+  }
 
   // POST /api/orders → manual; also preserve flag if an existing row already had it
   const isManual =
@@ -1744,26 +2030,37 @@ async function addWebhookOrder(order, options = {}) {
   raw_data.status = nextStatus;
   raw_data.orderStatus = nextStatus;
 
-  const payload = {
+  raw_data.source_integration_id = attributedSourceId;
+  raw_data.sourceIntegrationId = attributedSourceId;
+
+  const persistPayload = {
     order_id: sourceOrderId,
     status: nextStatus,
     raw_data,
-    created_at: createdAt.toISOString(),
+    source_integration_id: attributedSourceId,
   };
-  if (sourceIntegrationId) {
-    payload.source_integration_id = sourceIntegrationId;
-    raw_data.source_integration_id = sourceIntegrationId;
-    raw_data.sourceIntegrationId = sourceIntegrationId;
-  }
   if (orderReference != null && (await hasOrderReferenceColumn())) {
-    payload.order_reference = orderReference;
+    persistPayload.order_reference = orderReference;
   }
+
+  if (existingRow?.id) {
+    const { data, error } = await supabase
+      .from(ORDERS_TABLE)
+      .update(persistPayload)
+      .eq("id", existingRow.id)
+      .select()
+      .single();
+    if (error) throw new Error(error.message);
+    return mapStoredOrderToClient(data);
+  }
+
+  persistPayload.created_at = createdAt.toISOString();
 
   let lastError = null;
   for (let attempt = 0; attempt < 3; attempt++) {
     const { data, error } = await supabase
       .from(ORDERS_TABLE)
-      .upsert(payload, { onConflict: "company_id,order_id" })
+      .insert(persistPayload)
       .select()
       .single();
 
@@ -1775,11 +2072,34 @@ async function addWebhookOrder(order, options = {}) {
       String(error.message || "").includes("duplicate") ||
       String(error.code || "") === "23505";
     if (dup && orderReference != null && attempt < 2) {
+      const raced = pickOrderRow(
+        await fetchOrderRowsByExternalId(sourceOrderId),
+        fromWebhook
+          ? { sourceIntegrationId: attributedSourceId }
+          : { manualOnly: true },
+      );
+      if (raced?.id) {
+        const { data: updated, error: updateError } = await supabase
+          .from(ORDERS_TABLE)
+          .update(persistPayload)
+          .eq("id", raced.id)
+          .select()
+          .single();
+        if (updateError) throw new Error(updateError.message);
+        return mapStoredOrderToClient(updated);
+      }
       orderReference = await allocateNextOrderReference();
-      payload.order_reference = orderReference;
-      payload.raw_data = applyOrderReferenceToRawData(payload.raw_data, orderReference);
+      persistPayload.order_reference = orderReference;
+      persistPayload.raw_data = applyOrderReferenceToRawData(
+        persistPayload.raw_data,
+        orderReference,
+      );
       lastError = error;
       continue;
+    }
+
+    if (!fromWebhook && dup) {
+      throw orderDuplicateError();
     }
 
     throw new Error(error.message);
@@ -1926,7 +2246,7 @@ function applyProductCartIlikeFilters(query, { product_id, product_sku }) {
 
 async function getWebhookOrders({
   page = 1,
-  limit = 50,
+  limit = DEFAULT_LIST_LIMIT,
   from,
   to,
   status,
@@ -1940,7 +2260,15 @@ async function getWebhookOrders({
   phone,
   customer_name,
   ignoreEmployeeLogDateRange = false,
-}) {
+  source_integration_id,
+  allowLimitUpTo,
+} = {}) {
+  const safeLimit = clampListLimit(limit, {
+    fallback: DEFAULT_LIST_LIMIT,
+    max: Number(allowLimitUpTo) > MAX_LIST_LIMIT ? Number(allowLimitUpTo) : MAX_LIST_LIMIT,
+  });
+  page = Math.max(1, Number(page) || 1);
+  limit = safeLimit;
   const fromIndex = (page - 1) * limit;
   const toIndex = fromIndex + limit - 1;
   let orderIdsByEmployee = null;
@@ -2004,6 +2332,9 @@ async function getWebhookOrders({
     if (status) {
       q = q.eq("status", status);
     }
+    if (source_integration_id) {
+      q = q.eq("source_integration_id", source_integration_id);
+    }
     return applyRawDataMetaContains(q, {
       order_source,
       order_type,
@@ -2031,6 +2362,8 @@ async function getWebhookOrders({
   if (pPhone) {
     phoneOrderIds = await collectOrderIdsUnionIlikePaths({
       paths: [
+        "customer_phone",
+        "customer_phone_2",
         "raw_data->>phone",
         "raw_data->>mobile",
         "raw_data->>phone2",
@@ -2138,7 +2471,7 @@ async function getWebhookOrders({
       limit,
       total,
       totalPages: Math.ceil(total / limit) || 1,
-      data: rows.map((entry) => mapStoredOrderToClient(entry)),
+      data: rows.map((entry) => mapStoredOrderToListClient(entry)),
     };
   }
 
@@ -2150,7 +2483,7 @@ async function getWebhookOrders({
     return x;
   }
 
-  let query = supabase.from(ORDERS_TABLE).select("*", { count: "exact" });
+  let query = supabase.from(ORDERS_TABLE).select(`${ORDERS_LIST_SELECT}`, { count: "exact" });
   query = applyCoreListFilters(query);
   if (membershipOrderIds) {
     query = applyOrderIdMembershipFilter(query, membershipOrderIds);
@@ -2176,7 +2509,7 @@ async function getWebhookOrders({
     limit,
     total,
     totalPages: Math.ceil(total / limit) || 1,
-    data: rows.map((entry) => mapStoredOrderToClient(entry)),
+    data: rows.map((entry) => mapStoredOrderToListClient(entry)),
   };
 }
 
@@ -2199,6 +2532,7 @@ async function getWebhookOrdersForExport(filters, options = {}) {
       ...filters,
       page,
       limit: pageSize,
+      allowLimitUpTo: pageSize,
     });
 
     total = batch.total;
@@ -2225,7 +2559,7 @@ async function getWebhookOrdersForExport(filters, options = {}) {
   };
 }
 
-async function updateOrderStatus(orderId, status, changedBy) {
+async function updateOrderStatus(orderId, status, changedBy, options = {}) {
   if (!ALLOWED_ORDER_STATUSES.includes(status)) {
     const error = new Error("Invalid status value");
     error.code = "INVALID_STATUS";
@@ -2238,24 +2572,13 @@ async function updateOrderStatus(orderId, status, changedBy) {
     throw error;
   }
 
-  const { data: existingOrder, error: existingError } = await supabase
-    .from(ORDERS_TABLE)
-    .select("order_id,status")
-    .eq("order_id", orderId)
-    .single();
-
-  if (existingError || !existingOrder) {
-    const notFoundError = new Error("Order not found");
-    notFoundError.code = "ORDER_NOT_FOUND";
-    throw notFoundError;
-  }
-
+  const existingOrder = await resolveStoredOrderRow(orderId, options);
   const oldStatus = existingOrder.status;
 
   const { data, error } = await supabase
     .from(ORDERS_TABLE)
     .update({ status: status })
-    .eq("order_id", orderId)
+    .eq("id", existingOrder.id)
     .select()
     .single();
 
@@ -2265,6 +2588,7 @@ async function updateOrderStatus(orderId, status, changedBy) {
 
   await insertOrderStatusLog({
     orderId: data.order_id,
+    orderUuid: data.id,
     oldStatus,
     newStatus: data.status,
     changedBy,
@@ -2273,7 +2597,7 @@ async function updateOrderStatus(orderId, status, changedBy) {
   return mapStoredOrderToClient(data);
 }
 
-async function editOrder(orderId, updates, actor) {
+async function editOrder(orderId, updates, actor, options = {}) {
   const changedBy =
     actor && typeof actor === "object" && actor.id != null
       ? String(actor.id).trim()
@@ -2292,22 +2616,18 @@ async function editOrder(orderId, updates, actor) {
     throw error;
   }
 
-  const { data: existingOrder, error: existingError } = await supabase
-    .from(ORDERS_TABLE)
-    .select("order_id,status,raw_data,created_at")
-    .eq("order_id", orderId)
-    .single();
-
-  if (existingError || !existingOrder) {
-    const notFoundError = new Error("Order not found");
-    notFoundError.code = "ORDER_NOT_FOUND";
-    throw notFoundError;
-  }
+  const existingOrder = await resolveStoredOrderRow(orderId, options);
 
   let nextStatus = existingOrder.status;
   let shouldLogStatusChange = false;
 
   const normalizedIncomingUpdates = { ...normalizedUpdates };
+  delete normalizedIncomingUpdates.source_integration_id;
+  delete normalizedIncomingUpdates.sourceIntegrationId;
+  delete normalizedIncomingUpdates.company_id;
+  delete normalizedIncomingUpdates.companyId;
+  delete normalizedIncomingUpdates.localOrderId;
+  delete normalizedIncomingUpdates.orderRowId;
 
   if (
     Object.prototype.hasOwnProperty.call(normalizedIncomingUpdates, "orderStatus")
@@ -2515,7 +2835,7 @@ async function editOrder(orderId, updates, actor) {
       raw_data: mergedRawData,
       status: nextStatus,
     })
-    .eq("order_id", orderId)
+    .eq("id", existingOrder.id)
     .select()
     .single();
 
@@ -2526,6 +2846,7 @@ async function editOrder(orderId, updates, actor) {
   if (shouldLogStatusChange) {
     await insertOrderStatusLog({
       orderId: data.order_id,
+      orderUuid: data.id,
       oldStatus: existingOrder.status,
       newStatus: data.status,
       changedBy,
@@ -2727,6 +3048,13 @@ function buildEmptyStatsBreakdownResponse() {
  * Performance: single paginated scan of matching orders (same model as /stats/trend),
  * then aggregate byStatus / byOrderSource / byOrderType / byShippingStatus / totals in memory.
  */
+function applyOptionalSourceIntegrationEq(query, source_integration_id) {
+  if (source_integration_id) {
+    return query.eq("source_integration_id", source_integration_id);
+  }
+  return query;
+}
+
 async function getOrdersStatistics({
   employeeId,
   from,
@@ -2738,6 +3066,7 @@ async function getOrdersStatistics({
   status: listStatusFilter,
   product_id,
   product_sku,
+  source_integration_id,
 }) {
   let orderIds = null;
   let employeeScope = null;
@@ -2842,6 +3171,7 @@ async function getOrdersStatistics({
       const scoped = applyStatsOrderChunkAndProductFilter(q, chunk);
       if (scoped.skip) break;
       q = scoped.nextQ;
+      q = applyOptionalSourceIntegrationEq(q, source_integration_id);
 
       if (from && filterOrdersByCreatedAtInRange) {
         q = q.gte("created_at", from.toISOString());
@@ -2981,9 +3311,9 @@ function statsBucketKeyFromDbStatus(status) {
   return null;
 }
 
-const MAX_STATS_ROWS = 50000;
+const MAX_STATS_ROWS = 1500;
 
-const MAX_ANALYTICS_ROWS = 50000;
+const MAX_ANALYTICS_ROWS = 1500;
 
 function analyticsFirstNonEmpty(...values) {
   for (const value of values) {
@@ -3241,6 +3571,7 @@ async function fetchAnalyticsOrderRows({
   from,
   to,
   ignoreEmployeeLogDateRange = false,
+  source_integration_id,
 }) {
   let orderIdsByEmployee = null;
 
@@ -3269,6 +3600,7 @@ async function fetchAnalyticsOrderRows({
     if (to) {
       q = q.lte("created_at", to.toISOString());
     }
+    q = applyOptionalSourceIntegrationEq(q, source_integration_id);
     if (orderIdsByEmployee) {
       q = applyOrderIdMembershipFilter(q, orderIdsByEmployee);
     }
@@ -3338,6 +3670,7 @@ async function getOrdersAnalyticsReport({
   from,
   to,
   ignoreEmployeeLogDateRange = false,
+  source_integration_id,
 }) {
   const { rows, truncated } = await fetchAnalyticsOrderRows({
     product_id,
@@ -3346,6 +3679,7 @@ async function getOrdersAnalyticsReport({
     from,
     to,
     ignoreEmployeeLogDateRange,
+    source_integration_id,
   });
   const pid = normalizeProductIdForCartFilter(product_id);
   const productIdForUnitSum =
@@ -3358,7 +3692,7 @@ async function getOrdersAnalyticsReport({
   return { ...agg, truncated, maxRowsCap: MAX_ANALYTICS_ROWS };
 }
 
-const MAX_TREND_ROWS = 50000;
+const MAX_TREND_ROWS = 1500;
 
 function emptyTrendBucket() {
   return {
@@ -3476,6 +3810,7 @@ async function getOrdersStatsTimeSeries({
   status: listStatusFilter,
   product_id,
   product_sku,
+  source_integration_id,
   useEgyptBuckets = false,
 }) {
   const gran =
@@ -3611,6 +3946,7 @@ async function getOrdersStatsTimeSeries({
       const scoped = applyStatsOrderChunkAndProductFilter(q, chunk);
       if (scoped.skip) break;
       q = scoped.nextQ;
+      q = applyOptionalSourceIntegrationEq(q, source_integration_id);
 
       if (from && filterOrdersByCreatedAtInRange) {
         q = q.gte("created_at", from.toISOString());
@@ -3722,7 +4058,7 @@ async function getOrdersStatsTimeSeries({
   };
 }
 
-const MAX_PRODUCT_SALES_ROWS = 50000;
+const MAX_PRODUCT_SALES_ROWS = 1500;
 const PRODUCTS_TABLE =
   process.env.SUPABASE_PRODUCTS_TABLE || "products";
 
@@ -3742,20 +4078,38 @@ function finalizeProductSalesBucket(bucket) {
   };
 }
 
-async function loadProductCatalogMeta(productIds) {
-  const ids = [...new Set(productIds.filter(Boolean))];
+function productAnalyticsIdentityKey(sourceIntegrationId, externalId) {
+  const pid = String(externalId ?? "").trim();
+  if (!pid) return "";
+  const source = String(sourceIntegrationId ?? "").trim();
+  return `${source}::${pid}`;
+}
+
+async function loadProductCatalogMeta(identities) {
   const map = new Map();
+  const ids = [
+    ...new Set(
+      identities
+        .map((item) => String(item?.easyorder_id ?? "").trim())
+        .filter(Boolean),
+    ),
+  ];
   if (!ids.length) return map;
 
   for (const chunk of chunkArray(ids, IN_CHUNK_SIZE)) {
     const { data, error } = await supabase
       .from(PRODUCTS_TABLE)
-      .select("easyorder_id,name,sku")
+      .select("easyorder_id,name,sku,source_integration_id")
       .in("easyorder_id", chunk);
     if (error) continue;
     for (const row of data || []) {
       if (row?.easyorder_id == null) continue;
-      map.set(String(row.easyorder_id), {
+      const key = productAnalyticsIdentityKey(
+        row.source_integration_id,
+        row.easyorder_id,
+      );
+      if (!key || map.has(key)) continue;
+      map.set(key, {
         name: row.name ?? null,
         sku: row.sku ?? null,
       });
@@ -3774,6 +4128,7 @@ async function getProductSalesChart({
   to,
   granularity = "day",
   product_id,
+  source_integration_id,
   useEgyptBuckets = false,
 }) {
   const gran =
@@ -3802,7 +4157,7 @@ async function getProductSalesChart({
 
     let q = supabase
       .from(ORDERS_TABLE)
-      .select("order_id,created_at,raw_data,status");
+      .select("order_id,created_at,raw_data,status,source_integration_id");
 
     if (from) {
       q = q.gte("created_at", from.toISOString());
@@ -3810,6 +4165,7 @@ async function getProductSalesChart({
     if (to) {
       q = q.lte("created_at", to.toISOString());
     }
+    q = applyOptionalSourceIntegrationEq(q, source_integration_id);
     q = q.in("status", STATS_COUNTABLE_DB_STATUSES);
 
     if (productIdFilter && UUID_LIKE.test(productIdFilter)) {
@@ -3842,6 +4198,7 @@ async function getProductSalesChart({
           : {};
 
       const seenProductsInOrder = new Set();
+      const orderSourceId = row.source_integration_id ?? null;
       for (const line of parseCartItemsArray(raw)) {
         const pid = resolveLineProductId(line);
         if (!pid) continue;
@@ -3849,10 +4206,15 @@ async function getProductSalesChart({
           continue;
         }
 
-        if (!productMap.has(pid)) {
+        const identityKey = productAnalyticsIdentityKey(orderSourceId, pid);
+        if (!identityKey) continue;
+
+        if (!productMap.has(identityKey)) {
           const label = resolveLineProductLabel(line);
-          productMap.set(pid, {
-            product_id: pid,
+          productMap.set(identityKey, {
+            product_id: identityKey,
+            external_product_id: pid,
+            source_integration_id: orderSourceId,
             name: label.name,
             sku: label.sku,
             buckets: new Map(),
@@ -3860,7 +4222,7 @@ async function getProductSalesChart({
           });
         }
 
-        const productEntry = productMap.get(pid);
+        const productEntry = productMap.get(identityKey);
         const label = resolveLineProductLabel(line);
         if (!productEntry.name && label.name) productEntry.name = label.name;
         if (!productEntry.sku && label.sku) productEntry.sku = label.sku;
@@ -3878,8 +4240,8 @@ async function getProductSalesChart({
         productEntry.summary.totalUnits += units;
         productEntry.summary.totalRevenue += revenue;
 
-        if (!seenProductsInOrder.has(pid)) {
-          seenProductsInOrder.add(pid);
+        if (!seenProductsInOrder.has(identityKey)) {
+          seenProductsInOrder.add(identityKey);
           bucket.totalOrders += 1;
           productEntry.summary.totalOrders += 1;
         }
@@ -3890,11 +4252,17 @@ async function getProductSalesChart({
     offset += pageSize;
   }
 
-  const catalogMeta = await loadProductCatalogMeta([...productMap.keys()]);
+  const catalogMeta = await loadProductCatalogMeta(
+    [...productMap.values()].map((entry) => ({
+      easyorder_id: entry.external_product_id,
+      source_integration_id: entry.source_integration_id,
+    })),
+  );
   const products = [...productMap.values()]
     .map((entry) => {
       const catalog = catalogMeta.get(entry.product_id);
-      const name = catalog?.name || entry.name || entry.product_id;
+      const name =
+        catalog?.name || entry.name || entry.external_product_id || entry.product_id;
       const sku = catalog?.sku || entry.sku || null;
       const points = bucketKeys.map((date) => {
         const bucket = entry.buckets.get(date) || emptyProductSalesBucket();
@@ -3903,6 +4271,8 @@ async function getProductSalesChart({
 
       return {
         product_id: entry.product_id,
+        external_product_id: entry.external_product_id,
+        source_integration_id: entry.source_integration_id,
         name,
         sku,
         points,
@@ -3921,7 +4291,7 @@ async function getProductSalesChart({
   };
 }
 
-const MAX_ORDER_COST_ROWS = 50000;
+const MAX_ORDER_COST_ROWS = 1500;
 const SUCCESSFUL_SHIPPING_STATUS = "delivered";
 
 function roundMoney(value) {
@@ -4418,6 +4788,8 @@ module.exports = {
   getWebhookOrdersForExport,
   getWebhookOrderByReference,
   getWebhookOrderById,
+  orderIdentityOptionsFrom,
+  looksLikeLocalOrderUuid,
   findOrderByBostaAlias,
   markOrderSentToBosta,
   applyBostaFulfillmentWebhook,
@@ -4447,4 +4819,8 @@ module.exports = {
   normalizeOrderStatusInput,
   normalizeCustomerStatusInput,
   mergeOrderRawDataPatch,
+  mapStoredOrderToListClient,
+  ORDERS_LIST_SELECT,
+  MAX_LIST_LIMIT,
+  DEFAULT_LIST_LIMIT,
 };

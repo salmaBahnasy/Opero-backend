@@ -1,9 +1,13 @@
+const {
+  PUBLIC_COLUMNS,
+  listCompaniesNewestFirst,
+  getCompanyOverview,
+  loadCompanyOrThrow,
+  toPublicCompany,
+} = require("../services/platformCompanies.service");
 const supabase = require("../config/supabase");
 
 const COMPANIES_TABLE = process.env.SUPABASE_COMPANIES_TABLE || "companies";
-
-const PUBLIC_COLUMNS =
-  "id,name,slug,logo_url,login_image_url,favicon_url,primary_color,secondary_color,timezone,currency,is_active,deleted_at,created_at,updated_at";
 
 function slugify(value) {
   return String(value || "")
@@ -37,45 +41,50 @@ function coerceBoolean(raw) {
   return null;
 }
 
+function sendPlatformCompanyError(res, error, fallbackMessage) {
+  const status = Number(error?.statusCode) || 500;
+  const code = error?.code;
+  if (code === "COMPANY_NOT_FOUND") {
+    res.status(404).json({
+      success: false,
+      code,
+      message: "Company not found",
+    });
+    return;
+  }
+  if (status >= 400 && status < 500 && code) {
+    res.status(status).json({
+      success: false,
+      code,
+      message: error.message,
+    });
+    return;
+  }
+  console.error("[platform-companies]", {
+    message: error?.message,
+    code: error?.code,
+  });
+  res.status(500).json({
+    success: false,
+    message: fallbackMessage,
+  });
+}
+
 async function listCompanies(req, res) {
   try {
-    const { data, error } = await supabase
-      .from(COMPANIES_TABLE)
-      .select(PUBLIC_COLUMNS)
-      .order("created_at", { ascending: true });
-
-    if (error) throw new Error(error.message);
-    res.json({ success: true, data: data || [] });
+    const data = await listCompaniesNewestFirst();
+    res.json({ success: true, data });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Failed to list companies",
-      error: error.message,
-    });
+    sendPlatformCompanyError(res, error, "Failed to list companies");
   }
 }
 
 async function getCompany(req, res) {
   try {
-    const companyId = String(req.params.companyId || "").trim();
-    const { data, error } = await supabase
-      .from(COMPANIES_TABLE)
-      .select(PUBLIC_COLUMNS)
-      .eq("id", companyId)
-      .maybeSingle();
-
-    if (error) throw new Error(error.message);
-    if (!data) {
-      res.status(404).json({ success: false, message: "Company not found" });
-      return;
-    }
+    const data = await getCompanyOverview(req.params.companyId);
     res.json({ success: true, data });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Failed to get company",
-      error: error.message,
-    });
+    sendPlatformCompanyError(res, error, "Failed to get company");
   }
 }
 
@@ -125,22 +134,19 @@ async function createCompany(req, res) {
         });
         return;
       }
-      throw new Error(error.message);
+      throw error;
     }
 
-    res.status(201).json({ success: true, data });
+    res.status(201).json({ success: true, data: toPublicCompany(data) });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Failed to create company",
-      error: error.message,
-    });
+    sendPlatformCompanyError(res, error, "Failed to create company");
   }
 }
 
 async function updateCompany(req, res) {
   try {
     const companyId = String(req.params.companyId || "").trim();
+    await loadCompanyOrThrow(companyId);
     const body = req.body || {};
     const updates = {};
 
@@ -196,24 +202,25 @@ async function updateCompany(req, res) {
       .select(PUBLIC_COLUMNS)
       .maybeSingle();
 
-    if (error) throw new Error(error.message);
+    if (error) throw error;
     if (!data) {
-      res.status(404).json({ success: false, message: "Company not found" });
+      res.status(404).json({
+        success: false,
+        code: "COMPANY_NOT_FOUND",
+        message: "Company not found",
+      });
       return;
     }
-    res.json({ success: true, data });
+    res.json({ success: true, data: toPublicCompany(data) });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Failed to update company",
-      error: error.message,
-    });
+    sendPlatformCompanyError(res, error, "Failed to update company");
   }
 }
 
 async function setCompanyActive(req, res) {
   try {
     const companyId = String(req.params.companyId || "").trim();
+    await loadCompanyOrThrow(companyId);
     const active = coerceBoolean(req.body?.is_active ?? req.body?.isActive);
     if (active == null) {
       res.status(400).json({
@@ -230,18 +237,18 @@ async function setCompanyActive(req, res) {
       .select(PUBLIC_COLUMNS)
       .maybeSingle();
 
-    if (error) throw new Error(error.message);
+    if (error) throw error;
     if (!data) {
-      res.status(404).json({ success: false, message: "Company not found" });
+      res.status(404).json({
+        success: false,
+        code: "COMPANY_NOT_FOUND",
+        message: "Company not found",
+      });
       return;
     }
-    res.json({ success: true, data });
+    res.json({ success: true, data: toPublicCompany(data) });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Failed to update company status",
-      error: error.message,
-    });
+    sendPlatformCompanyError(res, error, "Failed to update company status");
   }
 }
 
@@ -251,4 +258,5 @@ module.exports = {
   createCompany,
   updateCompany,
   setCompanyActive,
+  sendPlatformCompanyError,
 };

@@ -286,8 +286,8 @@ async function fetchOrderCostDailyRows(from, to) {
 
 /**
  * جراف التكلفة:
- * - لو اليوم موجود في order_cost_daily → مصروفات + أعداد من التخزين (سريع)
- * - الأيام الناقصة فقط → live scan من orders
+ * - المصدر الطبيعي order_cost_daily
+ * - الأيام الناقصة تُعرض فارغة/جزئية بدون live scan
  */
 async function getOrderCostChartFromStorage({
   from,
@@ -312,27 +312,10 @@ async function getOrderCostChartFromStorage({
   }
 
   const missingDays = dayKeys.filter((d) => !byDate.has(d));
-  let ordersMap = new Map();
-  let shippedMap = new Map();
-  let deliveredMap = new Map();
-  let liveTruncated = false;
-
-  if (missingDays.length > 0) {
-    const live = await computeOrderCostBucketMapsForRange({
-      from,
-      to,
-      dateBasis,
-      granularity: "day",
-      useEgyptBuckets: true,
-    });
-    ordersMap = live.ordersMap;
-    shippedMap = live.shippedMap;
-    deliveredMap = live.deliveredMap;
-    liveTruncated = Boolean(live.truncated);
-  }
+  const emptyMap = new Map();
 
   const dailyPoints = dayKeys.map((date) =>
-    buildDayChartPoint(date, byDate.get(date), ordersMap, shippedMap, deliveredMap),
+    buildDayChartPoint(date, byDate.get(date), emptyMap, emptyMap, emptyMap),
   );
 
   const points =
@@ -345,20 +328,26 @@ async function getOrderCostChartFromStorage({
   const summary = summarizeChartPoints(points);
 
   return {
-    source: missingDays.length === 0 ? "database" : "database+live",
+    source: missingDays.length === 0 ? "database" : "database_partial",
     from: from.toISOString(),
     to: to.toISOString(),
     granularity: gran,
     dateBasis,
     formulaAr:
-      "تكلفة الطلب = المصروفات ÷ عدد الطلبات. الأيام المخزّنة من order_cost_daily؛ الأيام الناقصة تُحسب live من الطلبات.",
+      "تكلفة الطلب = المصروفات ÷ عدد الطلبات. المصدر الطبيعي هو order_cost_daily. الأيام غير المخزّنة تُعرض فارغة حتى يتم حفظ المصروف اليومي.",
     points,
     summary,
     storedDaysCount: dailyRows.length,
-    liveFilledDaysCount: missingDays.length,
+    liveFilledDaysCount: 0,
+    missingDaysCount: missingDays.length,
+    historicalGap: missingDays.length > 0,
+    messageAr:
+      missingDays.length > 0
+        ? "بعض الأيام غير مخزّنة في order_cost_daily لذلك يظهر التاريخ جزئياً. احفظ المصروف اليومي لإكمالها."
+        : null,
     daysInRange: dayKeys.length,
     bucketsInRange: bucketKeys.length,
-    truncated: liveTruncated,
+    truncated: false,
   };
 }
 

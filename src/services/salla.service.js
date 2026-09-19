@@ -1,142 +1,31 @@
-const axios = require("axios");
-const { getTenantProviderSecrets } = require("./companyIntegrations.service");
+const { sallaError } = require("./sallaAuth.service");
+const { sallaUserInfo } = require("./sallaClient.service");
 
-function getBaseUrl(secrets = {}) {
-  const raw = (
-    secrets.apiBaseUrl ||
-    process.env.SALLA_BASE_URL ||
-    "https://api.salla.dev/admin/v2"
+function requireExactSallaIntegrationId(options = {}) {
+  const integrationId = String(
+    options.integrationId || options.integration_id || "",
   ).trim();
-  return raw.replace(/\/$/, "");
-}
-
-async function getSallaClient(options = {}) {
-  const { secrets } = await getTenantProviderSecrets("salla", options);
-  const token = String(secrets.accessToken || "").trim();
-  if (!token) {
-    const err = new Error("Salla integration is not configured for this company");
-    err.code = "INTEGRATION_NOT_CONFIGURED";
-    err.provider = "salla";
-    throw err;
-  }
-  return {
-    token,
-    baseUrl: getBaseUrl(secrets),
-    headers: {
-      Authorization: `Bearer ${token}`,
-      Accept: "application/json",
-    },
-  };
-}
-
-/**
- * Normalizes list payload from Salla list responses (shape may vary by endpoint version).
- */
-function normalizeOrdersArray(payload) {
-  if (!payload) return [];
-  if (Array.isArray(payload)) return payload;
-  if (Array.isArray(payload.data)) return payload.data;
-  if (Array.isArray(payload.orders)) return payload.orders;
-  if (payload.data && Array.isArray(payload.data.data)) return payload.data.data;
-  return [];
-}
-
-async function requestSallaOrders(params, options = {}) {
-  const client = await getSallaClient(options);
-
-  const url = `${client.baseUrl}/orders`;
-  const response = await axios.get(url, {
-    headers: client.headers,
-    params: params || {},
-    timeout: 60000,
-    validateStatus: () => true,
-  });
-
-  if (response.status >= 400) {
-    const err = new Error(
-      response.data?.message ||
-        response.data?.error ||
-        `Salla API returned ${response.status}`,
+  if (!integrationId) {
+    throw sallaError(
+      "SALLA_INTEGRATION_REQUIRED",
+      "An exact Salla integrationId is required",
+      400,
     );
-    err.code = "SALLA_HTTP_ERROR";
-    err.status = response.status;
-    err.details = response.data;
-    throw err;
   }
-
-  return response.data;
+  return integrationId;
 }
 
-/**
- * GET orders from Salla (pass-through query params, e.g. page, per_page).
- */
-async function fetchSallaOrders(query, options = {}) {
-  return requestSallaOrders(query || {}, options);
-}
-
-/**
- * Verifies credentials by calling Salla orders list (minimal page).
- */
 async function verifySallaLogin(options = {}) {
-  return requestSallaOrders({ page: 1, per_page: 1 }, options);
-}
-
-/**
- * Fetches all orders from Salla (paginated) for stats only.
- */
-async function fetchAllSallaOrdersForStats(options = {}) {
-  const all = [];
-  let page = 1;
-  const per_page = 50;
-
-  for (;;) {
-    const payload = await requestSallaOrders({ page, per_page }, options);
-    const batch = normalizeOrdersArray(payload);
-    if (!batch.length) break;
-    all.push(...batch);
-    if (batch.length < per_page) break;
-    page += 1;
-    if (page > 500) break;
-  }
-
-  return all;
-}
-
-function pickOrderStatusKey(order) {
-  if (!order || typeof order !== "object") return "unknown";
-  if (order.status != null) {
-    if (typeof order.status === "object" && order.status !== null) {
-      if (order.status.slug != null) return String(order.status.slug);
-      if (order.status.name != null) return String(order.status.name);
-      if (order.status.id != null) return String(order.status.id);
-    }
-    return String(order.status);
-  }
-  if (order.order_status != null) return String(order.order_status);
-  if (order.state != null) return String(order.state);
-  return "unknown";
-}
-
-/**
- * Stats derived only from Salla order payloads (no EasyOrder / Supabase).
- */
-function computeStatsFromSallaOrders(orders) {
-  const byStatus = {};
-  for (const o of orders) {
-    const key = pickOrderStatusKey(o);
-    byStatus[key] = (byStatus[key] || 0) + 1;
-  }
-  return {
-    totalOrders: orders.length,
-    byStatus,
-  };
+  const integrationId = requireExactSallaIntegrationId(options);
+  const { getConnectionRow, assertSallaConnection } = require("./sallaAuth.service");
+  const { requireActiveCompanyId } = require("../utils/tenantScope");
+  const companyId = requireActiveCompanyId();
+  const row = assertSallaConnection(await getConnectionRow(integrationId), companyId);
+  await sallaUserInfo({ integration: row, allowDisabled: false });
+  return { ok: true, integrationId: row.id };
 }
 
 module.exports = {
-  getBaseUrl,
-  fetchSallaOrders,
   verifySallaLogin,
-  fetchAllSallaOrdersForStats,
-  computeStatsFromSallaOrders,
-  normalizeOrdersArray,
+  requireExactSallaIntegrationId,
 };

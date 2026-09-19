@@ -4,6 +4,7 @@ const {
   getDistrictsFromDb,
   getZonesFromDb,
 } = require("../services/bostaLocations.service");
+const { sendInternalError, shouldExposeErrorDetails } = require("../utils/safeError");
 
 function pickLocationSearchQuery(req) {
   const raw =
@@ -27,25 +28,19 @@ async function syncLocations(req, res) {
         success: false,
         message: "Bosta locations tables are not set up in Supabase",
         code: error.code,
-        error: error.message,
-        setupHint: error.setupHint,
+        setupHint: shouldExposeErrorDetails() ? error.setupHint : undefined,
       });
       return;
     }
     if (error.code === "BOSTA_HTTP_ERROR") {
       res.status(error.status >= 400 && error.status < 600 ? error.status : 502).json({
         success: false,
-        message: error.message,
+        message: shouldExposeErrorDetails() ? error.message : "Bosta request failed",
         code: error.code,
-        details: error.details,
       });
       return;
     }
-    res.status(500).json({
-      success: false,
-      message: "Failed to sync Bosta locations",
-      error: error.message,
-    });
+    sendInternalError(res, "Request failed", error, "bosta");
   }
 }
 
@@ -60,16 +55,11 @@ async function listCities(req, res) {
         success: false,
         message: "Bosta locations tables are not set up in Supabase",
         code: error.code,
-        error: error.message,
-        setupHint: error.setupHint,
+        setupHint: shouldExposeErrorDetails() ? error.setupHint : undefined,
       });
       return;
     }
-    res.status(500).json({
-      success: false,
-      message: "Failed to fetch cities",
-      error: error.message,
-    });
+    sendInternalError(res, "Request failed", error, "bosta");
   }
 }
 
@@ -99,16 +89,11 @@ async function listDistricts(req, res) {
         success: false,
         message: "Bosta locations tables are not set up in Supabase",
         code: error.code,
-        error: error.message,
-        setupHint: error.setupHint,
+        setupHint: shouldExposeErrorDetails() ? error.setupHint : undefined,
       });
       return;
     }
-    res.status(500).json({
-      success: false,
-      message: "Failed to fetch districts",
-      error: error.message,
-    });
+    sendInternalError(res, "Request failed", error, "bosta");
   }
 }
 
@@ -132,16 +117,11 @@ async function listZones(req, res) {
         success: false,
         message: "Bosta locations tables are not set up in Supabase",
         code: error.code,
-        error: error.message,
-        setupHint: error.setupHint,
+        setupHint: shouldExposeErrorDetails() ? error.setupHint : undefined,
       });
       return;
     }
-    res.status(500).json({
-      success: false,
-      message: "Failed to fetch zones",
-      error: error.message,
-    });
+    sendInternalError(res, "Request failed", error, "bosta");
   }
 }
 

@@ -12,6 +12,19 @@ const DEFAULT_TENANT_TABLES = [
   "bosta_sku_mappings",
   "bosta_unmapped_products",
   "employees",
+  "order_items",
+  "product_variants",
+  "product_options",
+  "product_option_values",
+  "variant_option_values",
+  "catalog_source_mappings",
+  "fulfillment_item_mappings",
+  "bundle_components",
+  "company_integrations",
+  "company_features",
+  "import_batches",
+  "import_batch_rows",
+  "import_row_errors",
 ];
 
 const TENANT_TABLES = new Set(
@@ -31,12 +44,26 @@ const TENANT_TABLES = new Set(
 );
 
 const ON_CONFLICT_REWRITE = {
-  orders: { order_id: "company_id,order_id" },
-  products: { easyorder_id: "company_id,easyorder_id" },
+  products: {
+    easyorder_id: "company_id,source_integration_id,easyorder_id",
+    "company_id,easyorder_id": "company_id,source_integration_id,easyorder_id",
+    "source_integration_id,easyorder_id":
+      "company_id,source_integration_id,easyorder_id",
+  },
   order_cost_daily: { cost_date: "company_id,cost_date" },
-  bosta_unmapped_products: { product_id: "company_id,product_id" },
+  bosta_unmapped_products: {
+    product_id: "company_id,product_id",
+    "shipping_integration_id,catalog_product_id":
+      "company_id,shipping_integration_id,catalog_product_id",
+    "company_id,shipping_integration_id,catalog_product_id":
+      "company_id,shipping_integration_id,catalog_product_id",
+  },
   bosta_sku_mappings: {
     "mapping_type,entity_id": "company_id,mapping_type,entity_id",
+    "shipping_integration_id,mapping_type,catalog_product_id":
+      "company_id,shipping_integration_id,mapping_type,catalog_product_id",
+    "shipping_integration_id,catalog_product_id,entity_id":
+      "company_id,shipping_integration_id,catalog_product_id,entity_id",
   },
 };
 
@@ -90,11 +117,12 @@ function withCompanyPayload(row, companyId) {
 function rewriteOnConflict(table, onConflict) {
   if (!onConflict) return onConflict;
   const normalized = String(onConflict).replace(/\s+/g, "");
+  const tableRewrites = ON_CONFLICT_REWRITE[table] || {};
+  if (tableRewrites[normalized]) return tableRewrites[normalized];
   if (normalized.split(",").includes("company_id")) {
     return normalized;
   }
-  const tableRewrites = ON_CONFLICT_REWRITE[table] || {};
-  return tableRewrites[normalized] || `company_id,${normalized}`;
+  return `company_id,${normalized}`;
 }
 
 function tenantFrom(client, table) {

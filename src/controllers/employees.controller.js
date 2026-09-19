@@ -9,6 +9,10 @@ const {
   isKnownRoleInput,
   withEmployeeRoleKeys,
 } = require("../utils/roles");
+const { assertPassword } = require("../utils/passwordPolicy");
+const { assertNotRemovingLastActiveAdmin } = require("../services/lastCompanyAdmin.service");
+const { sendInternalError } = require("../utils/safeError");
+const { sendKnownServiceError } = require("../utils/httpErrors");
 
 const EMPLOYEES_TABLE = process.env.SUPABASE_EMPLOYEES_TABLE || "employees";
 const COMPANIES_TABLE = process.env.SUPABASE_COMPANIES_TABLE || "companies";
@@ -145,18 +149,7 @@ async function login(req, res) {
       data: toPublicEmployee({ ...employee, company_id: company.id }),
     });
   } catch (error) {
-    console.error("[login] failed", {
-      message: error?.message,
-      code: error?.code,
-    });
-    const isDev = ["development", "dev", "test"].includes(
-      String(process.env.NODE_ENV || "").toLowerCase(),
-    );
-    res.status(500).json({
-      success: false,
-      message: "Failed to login",
-      ...(isDev ? { error: error?.message } : {}),
-    });
+    sendInternalError(res, "Failed to login", error, "login");
   }
 }
 
@@ -193,10 +186,74 @@ async function getEmployees(req, res) {
       data: (data || []).map((row) => toPublicEmployee(row)),
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Failed to fetch employees",
+    sendInternalError(res, "Failed to fetch employees", error, "employees");
+  }
+}
+
+/**
+ * Read-only company employee list for Dashboard / Orders filters.
+ * Does not weaken company_admin CRUD on GET /api/employees.
+ */
+async function getEmployeeDirectory(req, res) {
+  try {
+    const companyId = getCompanyId(req);
+    if (rejectMissingTenant(res, companyId)) return;
+
+    const { data, error } = await employeesTable()
+      .select(EMPLOYEE_PUBLIC_COLUMNS)
+      .eq("company_id", companyId)
+      .order("created_at", { ascending: false });
+
+    if (error) {
+      throw new Error(error.message);
+    }
+
+    res.json({
+      success: true,
+      total: (data || []).length,
+      data: (data || []).map((row) => toPublicEmployee(row)),
     });
+  } catch (error) {
+    sendInternalError(res, "Failed to fetch employee directory", error, "employees");
+  }
+}
+
+async function getEmployeeById(req, res) {
+  try {
+    const companyId = getCompanyId(req);
+    if (rejectMissingTenant(res, companyId)) return;
+    const employeeId = String(req.params.employeeId || "").trim();
+    if (!employeeId) {
+      res.status(400).json({
+        success: false,
+        message: "employeeId is required",
+      });
+      return;
+    }
+
+    const { data, error } = await employeesTable()
+      .select(EMPLOYEE_PUBLIC_COLUMNS)
+      .eq("company_id", companyId)
+      .eq("id", employeeId)
+      .maybeSingle();
+
+    if (error) {
+      throw new Error(error.message);
+    }
+    if (!data) {
+      res.status(404).json({
+        success: false,
+        message: "Employee not found",
+      });
+      return;
+    }
+
+    res.json({
+      success: true,
+      data: toPublicEmployee(data),
+    });
+  } catch (error) {
+    sendInternalError(res, "Failed to fetch employee", error, "employees");
   }
 }
 
@@ -215,6 +272,13 @@ async function addEmployee(req, res) {
       return;
     }
 
+    try {
+      assertPassword(password);
+    } catch (error) {
+      if (sendKnownServiceError(res, error)) return;
+      throw error;
+    }
+
     if (!isKnownRoleInput(roleInput)) {
       res.status(400).json({
         success: false,
@@ -226,6 +290,19 @@ async function addEmployee(req, res) {
 
     const hashedPassword = await bcrypt.hash(password, 10);
     const role = normalizeRole(roleInput);
+    const activeRaw = req.body?.is_active ?? req.body?.account_status;
+    let isActive = true;
+    if (activeRaw !== undefined) {
+      const coerced = coerceIsActive(activeRaw);
+      if (coerced === null) {
+        res.status(400).json({
+          success: false,
+          message: "Invalid is_active value",
+        });
+        return;
+      }
+      isActive = coerced;
+    }
 
     const { data, error } = await supabase
       .from(EMPLOYEES_TABLE)
@@ -235,7 +312,7 @@ async function addEmployee(req, res) {
         email: String(email).trim().toLowerCase(),
         password: hashedPassword,
         role,
-        is_active: true,
+        is_active: isActive,
       })
       .select(EMPLOYEE_PUBLIC_COLUMNS)
       .single();
@@ -250,10 +327,8 @@ async function addEmployee(req, res) {
       data: toPublicEmployee(data),
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Failed to add employee",
-    });
+    if (sendKnownServiceError(res, error)) return;
+    sendInternalError(res, "Failed to add employee", error, "employees");
   }
 }
 
@@ -262,6 +337,12 @@ async function deleteEmployee(req, res) {
     const companyId = getCompanyId(req);
     if (rejectMissingTenant(res, companyId)) return;
     const { employeeId } = req.params;
+
+    await assertNotRemovingLastActiveAdmin({
+      companyId,
+      employeeId,
+      deleting: true,
+    });
 
     const { data, error } = await employeesTable()
       .delete()
@@ -284,10 +365,8 @@ async function deleteEmployee(req, res) {
       data,
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Failed to delete employee",
-    });
+    if (sendKnownServiceError(res, error)) return;
+    sendInternalError(res, "Failed to delete employee", error, "employees");
   }
 }
 
@@ -369,6 +448,7 @@ async function editEmployee(req, res) {
     }
 
     if (password !== undefined) {
+      assertPassword(password);
       updates.password = await bcrypt.hash(password, 10);
     }
 
@@ -380,6 +460,13 @@ async function editEmployee(req, res) {
       });
       return;
     }
+
+    await assertNotRemovingLastActiveAdmin({
+      companyId,
+      employeeId,
+      nextRole: updates.role,
+      nextIsActive: updates.is_active,
+    });
 
     updates.updated_at = new Date().toISOString();
 
@@ -404,10 +491,8 @@ async function editEmployee(req, res) {
       data: toPublicEmployee(data),
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Failed to update employee",
-    });
+    if (sendKnownServiceError(res, error)) return;
+    sendInternalError(res, "Failed to update employee", error, "employees");
   }
 }
 
@@ -436,6 +521,12 @@ async function setEmployeeActive(req, res) {
       return;
     }
 
+    await assertNotRemovingLastActiveAdmin({
+      companyId,
+      employeeId,
+      nextIsActive: coerced,
+    });
+
     const { data, error } = await employeesTable()
       .update({
         is_active: coerced,
@@ -460,10 +551,8 @@ async function setEmployeeActive(req, res) {
       data: toPublicEmployee(data),
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Failed to update employee status",
-    });
+    if (sendKnownServiceError(res, error)) return;
+    sendInternalError(res, "Failed to update employee status", error, "employees");
   }
 }
 
@@ -472,6 +561,8 @@ module.exports = {
   /** @deprecated استخدم `login` أو `POST /api/employees/login` */
   loginSenior: login,
   getEmployees,
+  getEmployeeDirectory,
+  getEmployeeById,
   addEmployee,
   deleteEmployee,
   editEmployee,

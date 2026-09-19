@@ -7,6 +7,7 @@ const {
 } = require("../controllers/salla.controller");
 const { requireAuth } = require("../middlewares/auth.middleware");
 const { bindTenantScope } = require("../middlewares/tenant.middleware");
+const { requireCompanyFeature } = require("../middlewares/feature.middleware");
 
 function sallaLoginMethodNotAllowed(req, res) {
   res.status(405).json({
@@ -19,12 +20,14 @@ function sallaLoginMethodNotAllowed(req, res) {
 
 const router = express.Router();
 const requireTenant = [requireAuth, bindTenantScope];
+const requireOrders = [...requireTenant, requireCompanyFeature("orders")];
+const requireAnalytics = [...requireTenant, requireCompanyFeature("analytics")];
 
 router.post("/auth/login", ...requireTenant, sallaAuthLogin);
 router.post("/login", ...requireTenant, sallaAuthLogin);
 router.get("/auth/login", sallaLoginMethodNotAllowed);
 router.get("/login", sallaLoginMethodNotAllowed);
-router.get("/orders", ...requireTenant, sallaGetOrders);
-router.get("/stats", ...requireTenant, sallaGetStats);
+router.get("/orders", ...requireOrders, sallaGetOrders);
+router.get("/stats", ...requireAnalytics, sallaGetStats);
 
 module.exports = router;

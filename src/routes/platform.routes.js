@@ -11,6 +11,7 @@ const {
 } = require("../controllers/platformCompanies.controller");
 const {
   listCompanyIntegrations,
+  listAllIntegrationsOverview,
   getCompanyIntegration,
   createCompanyIntegration,
   updateCompanyIntegration,
@@ -18,6 +19,12 @@ const {
   rotateCompanyWebhookToken,
   testCompanyIntegration,
 } = require("../controllers/platformIntegrations.controller");
+const {
+  listEmployees,
+  listFeatures,
+  updateFeature,
+} = require("../controllers/platformCompanyOps.controller");
+const { connectSallaIntegration } = require("../controllers/sallaOauth.controller");
 
 const router = express.Router();
 
@@ -30,7 +37,11 @@ router.post("/companies", createCompany);
 router.get("/companies/:companyId", getCompany);
 router.patch("/companies/:companyId", updateCompany);
 router.patch("/companies/:companyId/active", setCompanyActive);
+router.get("/companies/:companyId/employees", listEmployees);
+router.get("/companies/:companyId/features", listFeatures);
+router.patch("/companies/:companyId/features/:featureKey", updateFeature);
 
+router.get("/integrations", listAllIntegrationsOverview);
 router.get("/companies/:companyId/integrations", listCompanyIntegrations);
 router.post("/companies/:companyId/integrations", createCompanyIntegration);
 router.get(
@@ -52,6 +63,10 @@ router.post(
 router.post(
   "/companies/:companyId/integrations/:integrationId/test",
   testCompanyIntegration,
+);
+router.post(
+  "/companies/:companyId/integrations/:integrationId/salla/connect",
+  connectSallaIntegration,
 );
 
 module.exports = router;

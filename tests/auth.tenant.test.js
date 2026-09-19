@@ -237,6 +237,44 @@ describe("tenant-aware employee authentication", () => {
     assert.equal(create.status, 403);
   });
 
+  it("ordinary employees can read the company directory without CRUD", async () => {
+    const token = signEmployeeToken({
+      employeeId: ENAYA_STAFF_ID,
+      companyId: ENAYA_ID,
+      role: "employee",
+      email: "staff@enaya.local",
+    });
+
+    const directory = await request("GET", "/api/employees/directory", {
+      token,
+    });
+    assert.equal(directory.status, 200);
+    const ids = (directory.json.data || []).map((row) => row.id).sort();
+    assert.deepEqual(ids, [ENAYA_ADMIN_ID, ENAYA_STAFF_ID].sort());
+    assert.equal(
+      (directory.json.data || []).some((row) => row.id === OTHER_STAFF_ID),
+      false,
+    );
+    assert.equal(
+      JSON.stringify(directory.json).includes("password"),
+      false,
+    );
+
+    const injected = await request(
+      "GET",
+      `/api/employees/directory?companyId=${OTHER_ID}`,
+      { token },
+    );
+    assert.equal(injected.status, 200);
+    assert.equal(
+      (injected.json.data || []).some((row) => row.id === OTHER_STAFF_ID),
+      false,
+    );
+
+    const list = await request("GET", "/api/employees", { token });
+    assert.equal(list.status, 403);
+  });
+
   it("create employee ignores company_id from the request body", async () => {
     const token = signEmployeeToken({
       employeeId: ENAYA_ADMIN_ID,
@@ -275,5 +313,102 @@ describe("tenant-aware employee authentication", () => {
 
     const { status } = await request("GET", "/api/employees", { token });
     assert.equal(status, 401);
+  });
+
+  it("G. company_admin cannot GET another company's employee by id", async () => {
+    const token = signEmployeeToken({
+      employeeId: ENAYA_ADMIN_ID,
+      companyId: ENAYA_ID,
+      role: "company_admin",
+      email: "admin@enaya.local",
+    });
+    const own = await request("GET", `/api/employees/${ENAYA_STAFF_ID}`, { token });
+    assert.equal(own.status, 200);
+    assert.equal(own.json.data.id, ENAYA_STAFF_ID);
+    assert.equal(own.json.data.companyId, ENAYA_ID);
+
+    const foreign = await request("GET", `/api/employees/${OTHER_STAFF_ID}`, {
+      token,
+    });
+    assert.equal(foreign.status, 404);
+  });
+
+  it("H. company_admin cannot delete another company's employee", async () => {
+    const token = signEmployeeToken({
+      employeeId: ENAYA_ADMIN_ID,
+      companyId: ENAYA_ID,
+      role: "company_admin",
+      email: "admin@enaya.local",
+    });
+    const { status } = await request("DELETE", `/api/employees/${OTHER_STAFF_ID}`, {
+      token,
+    });
+    assert.equal(status, 404);
+  });
+
+  it("I. platform admin JWT cannot use company employee CRUD", async () => {
+    const { signPlatformAdminToken } = require("../src/config/jwt");
+    const token = signPlatformAdminToken({
+      platformAdminId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+      email: "platform@saas.local",
+    });
+    const list = await request("GET", "/api/employees", { token });
+    assert.equal(list.status, 403);
+    assert.equal(list.json.code, "JWT_WRONG_SCOPE");
+
+    const create = await request("POST", "/api/employees", {
+      token,
+      body: {
+        name: "Should Fail",
+        email: "fail@enaya.local",
+        password: "TempPass123!",
+        companyId: ENAYA_ID,
+      },
+    });
+    assert.equal(create.status, 403);
+  });
+
+  it("J. the same email may exist in two different companies", async () => {
+    const sharedEmail = "shared.admin@example.test";
+    const enaya = signEmployeeToken({
+      employeeId: ENAYA_ADMIN_ID,
+      companyId: ENAYA_ID,
+      role: "company_admin",
+      email: "admin@enaya.local",
+    });
+    const other = signEmployeeToken({
+      employeeId: OTHER_ADMIN_ID,
+      companyId: OTHER_ID,
+      role: "company_admin",
+      email: "admin@other.local",
+    });
+
+    const createdA = await request("POST", "/api/employees", {
+      token: enaya,
+      body: {
+        name: "Shared Enaya",
+        email: sharedEmail,
+        password: "TempPass123!",
+        role: "employee",
+        companyId: OTHER_ID,
+      },
+    });
+    const createdB = await request("POST", "/api/employees", {
+      token: other,
+      body: {
+        name: "Shared Other",
+        email: sharedEmail,
+        password: "TempPass123!",
+        role: "employee",
+        companyId: ENAYA_ID,
+      },
+    });
+    assert.equal(createdA.status, 201, createdA.json?.message);
+    assert.equal(createdB.status, 201, createdB.json?.message);
+    assert.equal(createdA.json.data.companyId, ENAYA_ID);
+    assert.equal(createdB.json.data.companyId, OTHER_ID);
+    assert.equal(createdA.json.data.email, sharedEmail);
+    assert.equal(createdB.json.data.email, sharedEmail);
+    assert.notEqual(createdA.json.data.id, createdB.json.data.id);
   });
 });

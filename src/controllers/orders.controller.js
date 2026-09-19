@@ -12,6 +12,8 @@ const {
   getOrderCostMetrics,
   getWebhookOrderByReference,
   getWebhookOrderById,
+  orderIdentityOptionsFrom,
+  looksLikeLocalOrderUuid,
   ALLOWED_ORDER_STATUSES,
   ORDER_SOURCES,
   ORDER_TYPES,
@@ -22,9 +24,42 @@ const {
   normalizeCustomerStatusInput,
 } = require("../services/webhookOrders.service");
 const { toPresentation, withCustomerConfirmation } = require("../services/easyorderPresentation.service");
+const { clampListLimit, DEFAULT_LIST_LIMIT } = require("../utils/listPagination");
+
+/**
+ * Local confirmation view from stored columns. Does not call EasyOrders.
+ */
+function localCustomerConfirmation(order) {
+  if (!order) {
+    return { order: null, easyOrdersConfirm: null };
+  }
+  if (easyorderService.isManualOrder(order)) {
+    return {
+      order: {
+        ...order,
+        customer_status: order.customer_status || "confirmed",
+        customerStatus: order.customerStatus || "confirmed",
+        is_manual: true,
+        isManual: true,
+      },
+      easyOrdersConfirm: null,
+    };
+  }
+  const status = order.customer_status || order.customerStatus || null;
+  return {
+    order,
+    easyOrdersConfirm: {
+      id: order.sourceOrderId || order.order_id || null,
+      status,
+      customerStatus: status,
+      source: "local",
+    },
+  };
+}
 
 /**
  * Sync WhatsApp confirmation status from EasyOrders API (order.status).
+ * Explicit refresh only — not used on ordinary GET.
  */
 async function enrichOrderCustomerConfirmation(order, options = {}) {
   if (!order) {
@@ -55,7 +90,9 @@ const {
 const { withCache } = require("../services/dashboardCache.service");
 const { buildOrdersExcelBuffer } = require("../services/ordersExport.service");
 const { getCompanyId } = require("../middlewares/tenant.middleware");
+const { getConnection } = require("../services/companyIntegrations.service");
 const { sendKnownServiceError } = require("../utils/httpErrors");
+const { sendInternalError } = require("../utils/safeError");
 
 function tenantCachePayload(req, payload) {
   return { companyId: getCompanyId(req), ...payload };
@@ -210,42 +247,16 @@ function resolveOrdersTrendDateRange(req) {
 function resolveOrderCostsDateRange(req) {
   const dateParam = optionalQueryParam(req.query.date);
   if (dateParam) {
-    if (isEasyOrderApiRequest(req)) {
-      return getEgyptDayRange(dateParam);
-    }
-    const d = new Date(dateParam);
-    if (Number.isNaN(d.getTime())) {
-      const err = new Error('date must be "YYYY-MM-DD" or a valid ISO date');
-      err.code = "INVALID_DATE";
-      throw err;
-    }
-    const from = new Date(d);
-    from.setHours(0, 0, 0, 0);
-    const to = new Date(d);
-    to.setHours(23, 59, 59, 999);
-    return { from, to };
+    return getEgyptDayRange(dateParam);
   }
-  return resolveOrdersTrendDateRange(req);
+  return resolveEasyOrderDateRange(req);
 }
 
 /** افتراضي جراف التكلفة: من بداية الشهر (مصر) — مطابق لـ /stats */
 function resolveOrderCostChartDateRange(req) {
   const dateParam = optionalQueryParam(req.query.date);
   if (dateParam) {
-    if (isEasyOrderApiRequest(req)) {
-      return getEgyptDayRange(dateParam);
-    }
-    const d = new Date(dateParam);
-    if (Number.isNaN(d.getTime())) {
-      const err = new Error('date must be "YYYY-MM-DD" or a valid ISO date');
-      err.code = "INVALID_DATE";
-      throw err;
-    }
-    const from = new Date(d);
-    from.setHours(0, 0, 0, 0);
-    const to = new Date(d);
-    to.setHours(23, 59, 59, 999);
-    return { from, to };
+    return getEgyptDayRange(dateParam);
   }
 
   const fromRaw = req.query?.from;
@@ -257,36 +268,23 @@ function resolveOrderCostChartDateRange(req) {
     toRaw != null &&
     String(Array.isArray(toRaw) ? toRaw[0] : toRaw).trim() !== "";
 
-  if (isEasyOrderApiRequest(req)) {
-    if (hasFrom && !hasTo) {
-      return resolveSingleDayFromQueryValue(fromRaw);
-    }
-    if (!hasFrom && hasTo) {
-      return resolveSingleDayFromQueryValue(toRaw);
-    }
-    if (hasFrom && hasTo) {
-      const fromStr = String(
-        Array.isArray(fromRaw) ? fromRaw[0] : fromRaw,
-      ).trim();
-      const toStr = String(Array.isArray(toRaw) ? toRaw[0] : toRaw).trim();
-      if (/^\d{4}-\d{2}-\d{2}$/.test(fromStr) && fromStr === toStr) {
-        return getEgyptDayRange(fromStr);
-      }
+  if (hasFrom && !hasTo) {
+    return resolveSingleDayFromQueryValue(fromRaw);
+  }
+  if (!hasFrom && hasTo) {
+    return resolveSingleDayFromQueryValue(toRaw);
+  }
+  if (hasFrom && hasTo) {
+    const fromStr = String(
+      Array.isArray(fromRaw) ? fromRaw[0] : fromRaw,
+    ).trim();
+    const toStr = String(Array.isArray(toRaw) ? toRaw[0] : toRaw).trim();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(fromStr) && fromStr === toStr) {
+      return getEgyptDayRange(fromStr);
     }
   }
 
-  if (!hasFrom && !hasTo) {
-    if (isEasyOrderApiRequest(req)) {
-      return getEgyptMonthToDateRange();
-    }
-    const now = new Date();
-    const from = new Date(now);
-    from.setDate(from.getDate() - 29);
-    from.setHours(0, 0, 0, 0);
-    return { from, to: now };
-  }
-
-  return resolveOrdersTrendDateRange(req);
+  return resolveEasyOrderDateRange(req);
 }
 
 function mergeOrdersFilterSource(req) {
@@ -341,10 +339,133 @@ function optionalEnumFilter(value) {
   return optionalSentinelFilter(value);
 }
 
-function buildOrdersListFilters(req, pagination = {}) {
+const SOURCE_INTEGRATION_UUID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+async function resolveOptionalSourceIntegrationId(req) {
+  const source_integration_id = optionalSentinelFilter(
+    req.query.source_integration_id || req.query.sourceIntegrationId,
+  );
+  if (!source_integration_id) return null;
+  if (!SOURCE_INTEGRATION_UUID.test(source_integration_id)) {
+    const err = new Error("Invalid source_integration_id filter");
+    err.code = "INVALID_SOURCE_INTEGRATION";
+    throw err;
+  }
+  await getConnection(getCompanyId(req), source_integration_id);
+  return source_integration_id;
+}
+
+function sendAnalyticsRequestError(res, error) {
+  if (sendKnownServiceError(res, error)) return true;
+  if (sendOrdersListFilterError(res, error)) return true;
+  sendInternalError(res, "Failed to load analytics", error, "orders");
+  return true;
+}
+
+function rejectUnsupportedCostStoreFilter(req) {
+  const raw =
+    req.query?.source_integration_id ??
+    req.query?.sourceIntegrationId ??
+    req.body?.source_integration_id ??
+    req.body?.sourceIntegrationId;
+  const value = optionalSentinelFilter(raw);
+  if (!value) return;
+  const err = new Error(
+    "Store-specific costs are not supported. Daily expenses are company-wide.",
+  );
+  err.code = "COST_SOURCE_FILTER_UNSUPPORTED";
+  throw err;
+}
+
+function sendCostRequestError(res, error) {
+  if (error?.code === "COST_SOURCE_FILTER_UNSUPPORTED") {
+    res.status(400).json({
+      success: false,
+      code: error.code,
+      message: error.message,
+    });
+    return true;
+  }
+  if (sendKnownServiceError(res, error)) return true;
+  sendInternalError(res, "Failed to load order costs", error, "orders");
+  return true;
+}
+
+function sendOrdersListFilterError(res, error) {
+  if (
+    error.code === "INVALID_FROM" ||
+    error.code === "INVALID_TO" ||
+    error.code === "INVALID_DATE_RANGE"
+  ) {
+    res.status(400).json({ success: false, message: error.message });
+    return true;
+  }
+  if (error.code === "INVALID_STATUS") {
+    res.status(400).json({
+      success: false,
+      message: error.message,
+      allowedStatuses: ALLOWED_ORDER_STATUSES,
+    });
+    return true;
+  }
+  if (error.code === "INVALID_ORDER_SOURCE") {
+    res.status(400).json({
+      success: false,
+      message: error.message,
+      allowedOrderSources: ORDER_SOURCES,
+    });
+    return true;
+  }
+  if (error.code === "INVALID_ORDER_TYPE") {
+    res.status(400).json({
+      success: false,
+      message: error.message,
+      allowedOrderTypes: ORDER_TYPES,
+    });
+    return true;
+  }
+  if (error.code === "INVALID_SHIPPING_STATUS") {
+    res.status(400).json({
+      success: false,
+      message: error.message,
+      allowedShippingStatuses: SHIPPING_STATUSES,
+    });
+    return true;
+  }
+  if (error.code === "INVALID_CUSTOMER_STATUS") {
+    res.status(400).json({
+      success: false,
+      message: error.message,
+      allowedCustomerStatuses: CUSTOMER_STATUSES,
+    });
+    return true;
+  }
+  if (error.code === "INVALID_SOURCE_INTEGRATION") {
+    res.status(400).json({
+      success: false,
+      message: error.message,
+      code: error.code,
+    });
+    return true;
+  }
+  if (error.code === "INTEGRATION_NOT_FOUND") {
+    res.status(404).json({
+      success: false,
+      message: "Source integration not found",
+      code: "INTEGRATION_NOT_FOUND",
+    });
+    return true;
+  }
+  return false;
+}
+
+async function buildOrdersListFilters(req, pagination = {}) {
   const source = mergeOrdersFilterSource(req);
   const page = Number(pagination.page ?? source.page) || 1;
-  const limit = Number(pagination.limit ?? source.limit) || 50;
+  const limit = clampListLimit(pagination.limit ?? source.limit, {
+    fallback: DEFAULT_LIST_LIMIT,
+  });
 
   const filterReq = {
     ...req,
@@ -418,10 +539,23 @@ function buildOrdersListFilters(req, pagination = {}) {
   const employee_scope = optionalQueryParam(
     source.employee_scope || source.employeeScope,
   );
+  const source_integration_id = optionalSentinelFilter(
+    source.source_integration_id || source.sourceIntegrationId,
+  );
   const ignoreEmployeeLogDateRange =
     employee_scope === "all" ||
     employee_scope === "any" ||
     employee_scope === "all_time";
+
+  if (source_integration_id) {
+    if (!SOURCE_INTEGRATION_UUID.test(source_integration_id)) {
+      const err = new Error("Invalid source_integration_id filter");
+      err.code = "INVALID_SOURCE_INTEGRATION";
+      throw err;
+    }
+    const companyId = getCompanyId(req);
+    await getConnection(companyId, source_integration_id);
+  }
 
   if (status && !ALLOWED_ORDER_STATUSES.includes(status)) {
     const err = new Error(
@@ -477,6 +611,7 @@ function buildOrdersListFilters(req, pagination = {}) {
     phone,
     customer_name,
     ignoreEmployeeLogDateRange,
+    source_integration_id,
   };
 
   const appliedFilters = {
@@ -496,6 +631,7 @@ function buildOrdersListFilters(req, pagination = {}) {
     product_sku,
     phone,
     customer_name,
+    source_integration_id,
     page,
     limit,
   };
@@ -508,56 +644,9 @@ async function getOrders(req, res) {
     let filters;
     let appliedFilters;
     try {
-      ({ filters, appliedFilters } = buildOrdersListFilters(req));
+      ({ filters, appliedFilters } = await buildOrdersListFilters(req));
     } catch (error) {
-      if (error.code === "INVALID_FROM" || error.code === "INVALID_TO") {
-        res.status(400).json({ success: false, message: error.message });
-        return;
-      }
-      if (error.code === "INVALID_DATE_RANGE") {
-        res.status(400).json({ success: false, message: error.message });
-        return;
-      }
-      if (error.code === "INVALID_STATUS") {
-        res.status(400).json({
-          success: false,
-          message: error.message,
-          allowedStatuses: ALLOWED_ORDER_STATUSES,
-        });
-        return;
-      }
-      if (error.code === "INVALID_ORDER_SOURCE") {
-        res.status(400).json({
-          success: false,
-          message: error.message,
-          allowedOrderSources: ORDER_SOURCES,
-        });
-        return;
-      }
-      if (error.code === "INVALID_ORDER_TYPE") {
-        res.status(400).json({
-          success: false,
-          message: error.message,
-          allowedOrderTypes: ORDER_TYPES,
-        });
-        return;
-      }
-      if (error.code === "INVALID_SHIPPING_STATUS") {
-        res.status(400).json({
-          success: false,
-          message: error.message,
-          allowedShippingStatuses: SHIPPING_STATUSES,
-        });
-        return;
-      }
-      if (error.code === "INVALID_CUSTOMER_STATUS") {
-        res.status(400).json({
-          success: false,
-          message: error.message,
-          allowedCustomerStatuses: CUSTOMER_STATUSES,
-        });
-        return;
-      }
+      if (sendOrdersListFilterError(res, error)) return;
       throw error;
     }
 
@@ -574,19 +663,11 @@ async function getOrders(req, res) {
       appliedFilters,
       filterLists: getOrdersFilterLists(),
       listOrdersQueryReference:
-        "GET /api/orders?... phone|mobile|customer_phone and customer_name|customerName|full_name|fullName|name (partial match on customer name in raw_data). employeeId|employee_id (UUID or email). employee_scope=all|any|all_time: with employee, from/to apply to activity logs only. Without employee_scope: from/to on order_status_logs.changed_at. Without employee: from/to on orders.created_at. product_id or easyorder_id (UUID): cart match via @> (no SKU required).",
+        "GET /api/orders?... phone|mobile|customer_phone and customer_name|customerName|full_name|fullName|name (partial match on customer name in raw_data). employeeId|employee_id (UUID or email). employee_scope=all|any|all_time: with employee, from/to apply to activity logs only. Without employee_scope: from/to on order_status_logs.changed_at. Without employee: from/to on orders.created_at. product_id or easyorder_id (UUID): cart match via @> (no SKU required). source_integration_id (UUID): tenant-owned commerce connection filter applied at query level.",
       ...result,
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Failed to fetch orders",
-      error:
-        error?.message ||
-        error?.cause?.message ||
-        String(error) ||
-        "Unknown error",
-    });
+    sendInternalError(res, "Failed to fetch orders", error, "orders");
   }
 }
 
@@ -599,56 +680,9 @@ async function exportOrders(req, res) {
   try {
     let filters;
     try {
-      ({ filters } = buildOrdersListFilters(req));
+      ({ filters } = await buildOrdersListFilters(req));
     } catch (error) {
-      if (
-        error.code === "INVALID_FROM" ||
-        error.code === "INVALID_TO" ||
-        error.code === "INVALID_DATE_RANGE"
-      ) {
-        res.status(400).json({ success: false, message: error.message });
-        return;
-      }
-      if (error.code === "INVALID_STATUS") {
-        res.status(400).json({
-          success: false,
-          message: error.message,
-          allowedStatuses: ALLOWED_ORDER_STATUSES,
-        });
-        return;
-      }
-      if (error.code === "INVALID_ORDER_SOURCE") {
-        res.status(400).json({
-          success: false,
-          message: error.message,
-          allowedOrderSources: ORDER_SOURCES,
-        });
-        return;
-      }
-      if (error.code === "INVALID_ORDER_TYPE") {
-        res.status(400).json({
-          success: false,
-          message: error.message,
-          allowedOrderTypes: ORDER_TYPES,
-        });
-        return;
-      }
-      if (error.code === "INVALID_SHIPPING_STATUS") {
-        res.status(400).json({
-          success: false,
-          message: error.message,
-          allowedShippingStatuses: SHIPPING_STATUSES,
-        });
-        return;
-      }
-      if (error.code === "INVALID_CUSTOMER_STATUS") {
-        res.status(400).json({
-          success: false,
-          message: error.message,
-          allowedCustomerStatuses: CUSTOMER_STATUSES,
-        });
-        return;
-      }
+      if (sendOrdersListFilterError(res, error)) return;
       throw error;
     }
 
@@ -684,11 +718,7 @@ async function exportOrders(req, res) {
 
     res.send(buffer);
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Failed to export orders",
-      error: error.message,
-    });
+    sendInternalError(res, "Failed to export orders", error, "orders");
   }
 }
 
@@ -707,7 +737,12 @@ async function changeOrderStatus(req, res) {
     }
 
     const changedBy = req.user?.id;
-    const updatedOrder = await updateOrderStatus(orderId, status, changedBy);
+    const updatedOrder = await updateOrderStatus(
+      orderId,
+      status,
+      changedBy,
+      orderIdentityOptionsFrom(req),
+    );
 
     res.json({
       success: true,
@@ -715,6 +750,7 @@ async function changeOrderStatus(req, res) {
       data: updatedOrder,
     });
   } catch (error) {
+    if (sendKnownServiceError(res, error)) return;
     if (error.code === "INVALID_STATUS") {
       res.status(400).json({
         success: false,
@@ -740,11 +776,7 @@ async function changeOrderStatus(req, res) {
       return;
     }
 
-    res.status(500).json({
-      success: false,
-      message: "Failed to update order status",
-      error: error.message,
-    });
+    sendInternalError(res, "Failed to update order status", error, "orders");
   }
 }
 
@@ -796,6 +828,7 @@ async function createOrder(req, res) {
       data: createdOrder,
     });
   } catch (error) {
+    if (sendKnownServiceError(res, error)) return;
     if (error.code === "INVALID_ORDER_META") {
       res.status(400).json({
         success: false,
@@ -816,11 +849,7 @@ async function createOrder(req, res) {
       return;
     }
 
-    res.status(500).json({
-      success: false,
-      message: "Failed to create order",
-      error: error.message,
-    });
+    sendInternalError(res, "Failed to create order", error, "orders");
   }
 }
 
@@ -841,7 +870,12 @@ async function updateOrder(req, res) {
       req.user?.id != null && String(req.user.id).trim() !== ""
         ? { id: req.user.id, email: req.user.email }
         : null;
-    const updatedOrder = await editOrder(orderId, updates, actor);
+    const updatedOrder = await editOrder(
+      orderId,
+      updates,
+      actor,
+      orderIdentityOptionsFrom(req),
+    );
 
     res.json({
       success: true,
@@ -849,6 +883,7 @@ async function updateOrder(req, res) {
       data: updatedOrder,
     });
   } catch (error) {
+    if (sendKnownServiceError(res, error)) return;
     if (error.code === "INVALID_UPDATES") {
       res.status(400).json({
         success: false,
@@ -893,11 +928,7 @@ async function updateOrder(req, res) {
       return;
     }
 
-    res.status(500).json({
-      success: false,
-      message: "Failed to update order",
-      error: error.message,
-    });
+    sendInternalError(res, "Failed to update order", error, "orders");
   }
 }
 
@@ -923,7 +954,7 @@ async function getOrderByReference(req, res) {
 
     const order = await getWebhookOrderByReference(rawRef);
     const { order: enrichedOrder, easyOrdersConfirm } =
-      await enrichOrderCustomerConfirmation(order);
+      localCustomerConfirmation(order);
 
     if (req.query.presented === "true") {
       const presented = withCustomerConfirmation(
@@ -973,11 +1004,7 @@ async function getOrderByReference(req, res) {
       });
       return;
     }
-    res.status(500).json({
-      success: false,
-      message: "Failed to fetch order by reference",
-      error: error.message,
-    });
+    sendInternalError(res, "Failed to fetch order by reference", error, "orders");
   }
 }
 
@@ -987,7 +1014,10 @@ async function getEasyOrderDetails(req, res) {
 
     let localOrder = null;
     try {
-      localOrder = await getWebhookOrderById(orderId);
+      localOrder = await getWebhookOrderById(
+        orderId,
+        orderIdentityOptionsFrom(req),
+      );
     } catch (error) {
       if (error.code !== "ORDER_NOT_FOUND") {
         throw error;
@@ -996,7 +1026,7 @@ async function getEasyOrderDetails(req, res) {
 
     if (localOrder) {
       const { order: enrichedOrder, easyOrdersConfirm } =
-        await enrichOrderCustomerConfirmation(localOrder);
+        localCustomerConfirmation(localOrder);
 
       if (req.query.raw === "true") {
         res.json({
@@ -1016,6 +1046,15 @@ async function getEasyOrderDetails(req, res) {
       res.json({
         success: true,
         data: presented,
+      });
+      return;
+    }
+
+    if (looksLikeLocalOrderUuid(orderId)) {
+      res.status(404).json({
+        success: false,
+        message: "Order not found",
+        orderId,
       });
       return;
     }
@@ -1085,10 +1124,14 @@ async function getEasyOrderDetails(req, res) {
       });
       return;
     }
-    res.status(error.response?.status || 500).json({
+    const status = Number(error.response?.status) || 500;
+    if (status >= 500) {
+      sendInternalError(res, "Failed to fetch order details", error, "orders");
+      return;
+    }
+    res.status(status).json({
       success: false,
       message: "Failed to fetch order details",
-      error: error.response?.data || error.message,
     });
   }
 }
@@ -1109,7 +1152,10 @@ async function refreshCustomerStatus(req, res) {
     }
 
     const result =
-      await easyorderService.refreshCustomerStatusFromEasyOrders(orderId);
+      await easyorderService.refreshCustomerStatusFromEasyOrders(
+        orderId,
+        orderIdentityOptionsFrom(req),
+      );
 
     const presented = withCustomerConfirmation(
       toPresentation(result.order) || result.order,
@@ -1144,10 +1190,13 @@ async function refreshCustomerStatus(req, res) {
     }
 
     const status = error.statusCode || error.response?.status || 500;
+    if (status >= 500) {
+      sendInternalError(res, "Failed to refresh customer status from EasyOrders", error, "orders");
+      return;
+    }
     res.status(status).json({
       success: false,
       message: "Failed to refresh customer status from EasyOrders",
-      error: error.response?.data || error.message,
       orderId: req.params.orderId,
     });
   }
@@ -1206,6 +1255,7 @@ async function getOrdersStats(req, res) {
     const product_sku = optionalQueryParam(
       req.query.product_sku || req.query.productSku,
     );
+    const source_integration_id = await resolveOptionalSourceIntegrationId(req);
 
     if (status && !ALLOWED_ORDER_STATUSES.includes(status)) {
       res.status(400).json({
@@ -1249,7 +1299,7 @@ async function getOrdersStats(req, res) {
     let from;
     let to;
     try {
-      ({ from, to } = resolveOrdersStatsDateRange(req));
+      ({ from, to } = resolveEasyOrderDateRange(req));
     } catch (error) {
       if (error.code === "INVALID_FROM" || error.code === "INVALID_TO") {
         res.status(400).json({ success: false, message: error.message });
@@ -1271,6 +1321,7 @@ async function getOrdersStats(req, res) {
         status,
         product_id,
         product_sku,
+        source_integration_id,
       }),
       () =>
         getOrdersStatistics({
@@ -1284,6 +1335,7 @@ async function getOrdersStats(req, res) {
           status,
           product_id,
           product_sku,
+          source_integration_id,
         }),
     ).then((r) => r.value);
 
@@ -1313,16 +1365,14 @@ async function getOrdersStats(req, res) {
         product_id: product_id || null,
         easyorder_id: easyorder_id || null,
         product_sku: product_sku || null,
+        source_integration_id: source_integration_id || null,
       },
       stats: statsWithLegacyKeys,
       filterLists: getOrdersFilterLists(),
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Failed to get stats",
-      error: error.message,
-    });
+    if (sendAnalyticsRequestError(res, error)) return;
+    sendInternalError(res, "Failed to get stats", error, "orders");
   }
 }
 
@@ -1366,6 +1416,7 @@ async function getOrdersStatsTrend(req, res) {
     const product_sku = optionalQueryParam(
       req.query.product_sku || req.query.productSku,
     );
+    const source_integration_id = await resolveOptionalSourceIntegrationId(req);
 
     const granRaw = optionalQueryParam(req.query.granularity);
     const granularity =
@@ -1413,7 +1464,7 @@ async function getOrdersStatsTrend(req, res) {
     let from;
     let to;
     try {
-      ({ from, to } = resolveOrdersTrendDateRange(req));
+      ({ from, to } = resolveEasyOrderDateRange(req));
     } catch (error) {
       if (error.code === "INVALID_FROM" || error.code === "INVALID_TO") {
         res.status(400).json({ success: false, message: error.message });
@@ -1436,7 +1487,8 @@ async function getOrdersStatsTrend(req, res) {
         status,
         product_id,
         product_sku,
-        useEgyptBuckets: isEasyOrderApiRequest(req),
+        source_integration_id,
+        useEgyptBuckets: true,
       }),
       () =>
         getOrdersStatsTimeSeries({
@@ -1451,7 +1503,8 @@ async function getOrdersStatsTrend(req, res) {
           status,
           product_id,
           product_sku,
-          useEgyptBuckets: isEasyOrderApiRequest(req),
+          source_integration_id,
+          useEgyptBuckets: true,
         }),
     ).then((r) => r.value);
 
@@ -1471,16 +1524,14 @@ async function getOrdersStatsTrend(req, res) {
         product_id: product_id || null,
         easyorder_id: easyorder_id || null,
         product_sku: product_sku || null,
+        source_integration_id: source_integration_id || null,
       },
       chart,
       filterLists: getOrdersFilterLists(),
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Failed to build orders stats trend",
-      error: error.message,
-    });
+    if (sendAnalyticsRequestError(res, error)) return;
+    sendInternalError(res, "Failed to build orders stats trend", error, "orders");
   }
 }
 
@@ -1495,6 +1546,7 @@ async function getOrdersAnalytics(req, res) {
     const product_sku = optionalQueryParam(
       req.query.product_sku || req.query.productSku,
     );
+    const source_integration_id = await resolveOptionalSourceIntegrationId(req);
 
     if (!product_id && !product_sku) {
       res.status(400).json({
@@ -1549,6 +1601,7 @@ async function getOrdersAnalytics(req, res) {
       from,
       to,
       ignoreEmployeeLogDateRange,
+      source_integration_id,
     });
 
     res.json({
@@ -1562,6 +1615,7 @@ async function getOrdersAnalytics(req, res) {
         ignoreEmployeeLogDateRange,
         from: from ? from.toISOString() : null,
         to: to ? to.toISOString() : null,
+        source_integration_id: source_integration_id || null,
       },
       summary: {
         totalCost: report.totalCost,
@@ -1581,11 +1635,8 @@ async function getOrdersAnalytics(req, res) {
       },
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Failed to build orders analytics",
-      error: error.message,
-    });
+    if (sendAnalyticsRequestError(res, error)) return;
+    sendInternalError(res, "Failed to build orders analytics", error, "orders");
   }
 }
 
@@ -1605,6 +1656,7 @@ async function getProductSalesChartHandler(req, res) {
     const product_id =
       optionalQueryParam(req.query.product_id || req.query.productId) ||
       easyorder_id;
+    const source_integration_id = await resolveOptionalSourceIntegrationId(req);
 
     const granRaw = optionalQueryParam(req.query.granularity);
     const granularity =
@@ -1613,7 +1665,7 @@ async function getProductSalesChartHandler(req, res) {
     let from;
     let to;
     try {
-      ({ from, to } = resolveOrdersTrendDateRange(req));
+      ({ from, to } = resolveEasyOrderDateRange(req));
     } catch (error) {
       if (error.code === "INVALID_FROM" || error.code === "INVALID_TO") {
         res.status(400).json({ success: false, message: error.message });
@@ -1622,13 +1674,26 @@ async function getProductSalesChartHandler(req, res) {
       throw error;
     }
 
-    const chart = await getProductSalesChart({
-      from,
-      to,
-      granularity,
-      product_id,
-      useEgyptBuckets: isEasyOrderApiRequest(req),
-    });
+    const chart = await withCache(
+      "product-sales-chart",
+      tenantCachePayload(req, {
+        from: from.toISOString(),
+        to: to.toISOString(),
+        granularity,
+        product_id,
+        source_integration_id,
+        useEgyptBuckets: true,
+      }),
+      () =>
+        getProductSalesChart({
+          from,
+          to,
+          granularity,
+          product_id,
+          source_integration_id,
+          useEgyptBuckets: true,
+        }),
+    ).then((r) => r.value);
 
     res.json({
       success: true,
@@ -1638,15 +1703,13 @@ async function getProductSalesChartHandler(req, res) {
         granularity,
         product_id: product_id || null,
         easyorder_id: easyorder_id || null,
+        source_integration_id: source_integration_id || null,
       },
       chart,
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Failed to build product sales chart",
-      error: error.message,
-    });
+    if (sendAnalyticsRequestError(res, error)) return;
+    sendInternalError(res, "Failed to build product sales chart", error, "orders");
   }
 }
 
@@ -1658,6 +1721,7 @@ async function getProductSalesChartHandler(req, res) {
  */
 async function getOrderCosts(req, res) {
   try {
+    rejectUnsupportedCostStoreFilter(req);
     const expenseRaw = req.query.expense ?? req.query.spent ?? req.query.spend;
 
     if (
@@ -1715,6 +1779,7 @@ async function getOrderCosts(req, res) {
       metrics,
     });
   } catch (error) {
+    if (sendCostRequestError(res, error)) return;
     if (error.code === "INVALID_EXPENSE") {
       res.status(400).json({
         success: false,
@@ -1723,11 +1788,7 @@ async function getOrderCosts(req, res) {
       return;
     }
 
-    res.status(500).json({
-      success: false,
-      message: "Failed to compute order costs",
-      error: error.message,
-    });
+    sendInternalError(res, "Failed to compute order costs", error, "orders");
   }
 }
 
@@ -1737,6 +1798,7 @@ async function getOrderCosts(req, res) {
  */
 async function saveOrderCostDailyHandler(req, res) {
   try {
+    rejectUnsupportedCostStoreFilter(req);
     const dateRaw = req.body?.date ?? req.query.date ?? req.body?.cost_date;
     const expenseRaw =
       req.body?.expense ??
@@ -1790,15 +1852,12 @@ async function saveOrderCostDailyHandler(req, res) {
       chartPoint: result.chartPoint,
     });
   } catch (error) {
+    if (sendCostRequestError(res, error)) return;
     if (error.code === "INVALID_DATE" || error.code === "INVALID_EXPENSE") {
       res.status(400).json({ success: false, message: error.message });
       return;
     }
-    res.status(500).json({
-      success: false,
-      message: "Failed to save daily order cost",
-      error: error.message,
-    });
+    sendInternalError(res, "Failed to save daily order cost", error, "orders");
   }
 }
 
@@ -1808,6 +1867,7 @@ async function saveOrderCostDailyHandler(req, res) {
  */
 async function getOrderCostChartHandler(req, res) {
   try {
+    rejectUnsupportedCostStoreFilter(req);
     const granRaw = optionalQueryParam(req.query.granularity);
     const granularity =
       granRaw === "week" || granRaw === "month" ? granRaw : "day";
@@ -1867,11 +1927,8 @@ async function getOrderCostChartHandler(req, res) {
       chart,
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Failed to build order cost chart",
-      error: error.message,
-    });
+    if (sendCostRequestError(res, error)) return;
+    sendInternalError(res, "Failed to build order cost chart", error, "orders");
   }
 }
 

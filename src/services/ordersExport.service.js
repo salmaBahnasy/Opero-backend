@@ -65,7 +65,7 @@ function formatDateTime(value) {
 function orderToExportRow(order) {
   return {
     "رقم الطلب": order.order_reference ?? order.orderReference ?? "",
-    "معرف الطلب": order.sourceOrderId ?? order.id ?? "",
+    "معرف الطلب": order.sourceOrderId ?? order.order_id ?? "",
     "اسم العميل": order.full_name ?? order.firstName ?? order.customer_name ?? "",
     "الهاتف": order.phone ?? order.mobile ?? "",
     "هاتف 2": order.phone2 ?? order.secondaryPhone ?? "",

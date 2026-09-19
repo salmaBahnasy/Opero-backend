@@ -2,31 +2,32 @@ const {
   mapLocalOrderToBostaPayload,
   createFulfillmentOrder,
   createFulfillmentOrdersBulk,
-  getWebhookUrl,
   fetchBostaInventoryAvailabilityMap,
   getFulfillmentKeyDiagnostics,
   firstNonEmpty,
 } = require("../services/bostaFulfillment.service");
 const {
   getWebhookOrderById,
+  orderIdentityOptionsFrom,
   markOrderSentToBosta,
   applyBostaFulfillmentWebhook,
 } = require("../services/webhookOrders.service");
 const { sendKnownServiceError } = require("../utils/httpErrors");
+const { sendInternalError, shouldExposeErrorDetails } = require("../utils/safeError");
 const { runWithIntegration } = require("../utils/tenantScope");
-const { resolveOwnedConnection } = require("../services/companyIntegrations.service");
+const {
+  resolveBostaShippingConnection,
+  pickShippingIntegrationId,
+} = require("../services/bostaShipping.service");
 
 async function withBostaConnection(req, fn) {
-  const connection = await resolveOwnedConnection({
-    provider: "bosta",
-    category: "shipping",
-    integrationId:
-      req.body?.shippingIntegrationId ||
-      req.body?.shipping_integration_id ||
-      req.body?.integrationId ||
-      req.query?.integrationId,
-  });
-  return runWithIntegration(connection, fn);
+  const connection = await resolveBostaShippingConnection(
+    pickShippingIntegrationId({
+      ...req.body,
+      ...req.query,
+    }),
+  );
+  return runWithIntegration(connection, async () => fn(connection));
 }
 
 function pickOverrides(body = {}) {
@@ -95,23 +96,26 @@ function inventoryErrorResponse(error) {
 async function sendOrderToBosta(req, res) {
   try {
     const { orderId } = req.params;
-    await withBostaConnection(req, async () => {
-      const localOrder = await getWebhookOrderById(orderId);
+    await withBostaConnection(req, async (connection) => {
+      const localOrder = await getWebhookOrderById(
+        orderId,
+        orderIdentityOptionsFrom(req),
+      );
       const overrides = pickOverrides(req.body || {});
       const payload = await mapLocalOrderToBostaPayload(localOrder, overrides);
 
       const bostaResult = await createFulfillmentOrder(payload);
       const updatedOrder = await markOrderSentToBosta(
-        localOrder.sourceOrderId,
+        localOrder.localOrderId || localOrder.sourceOrderId,
         bostaResult,
         payload,
+        { shippingIntegrationId: connection.id },
       );
 
       res.json({
         success: true,
         message: "Order sent to Bosta successfully",
         bosta: bostaResult,
-        webhookUrl: await getWebhookUrl(),
         data: updatedOrder,
       });
     });
@@ -144,18 +148,13 @@ async function sendOrderToBosta(req, res) {
     if (error.code === "BOSTA_API_ERROR") {
       res.status(error.status || 502).json({
         success: false,
-        message: error.message,
-        errors: error.details?.errors || [error.message],
-        details: error.details,
+        message: shouldExposeErrorDetails() ? error.message : "Bosta request failed",
+        code: error.code,
       });
       return;
     }
 
-    res.status(500).json({
-      success: false,
-      message: "Failed to send order to Bosta",
-      error: error.message,
-    });
+    sendInternalError(res, "Request failed", error, "bosta");
   }
 }
 
@@ -174,7 +173,7 @@ async function sendOrdersToBostaBulk(req, res) {
       return;
     }
 
-    const result = await withBostaConnection(req, async () => {
+    const result = await withBostaConnection(req, async (connection) => {
     const sharedOverrides = pickOverrides(req.body || {});
     const perOrderOverrides =
       req.body?.perOrderOverrides && typeof req.body.perOrderOverrides === "object"
@@ -188,7 +187,10 @@ async function sendOrdersToBostaBulk(req, res) {
     for (let i = 0; i < orderIds.length; i += 1) {
       const orderId = orderIds[i];
       try {
-        const localOrder = await getWebhookOrderById(orderId);
+        const localOrder = await getWebhookOrderById(
+          orderId,
+          orderIdentityOptionsFrom(req),
+        );
         const overrides = {
           ...sharedOverrides,
           ...(perOrderOverrides[orderId] || {}),
@@ -197,6 +199,7 @@ async function sendOrdersToBostaBulk(req, res) {
         payloads.push(payload);
         meta.push({
           orderId: localOrder.sourceOrderId,
+          localOrderId: localOrder.localOrderId,
           orderAlias: payload.orderAlias,
         });
       } catch (error) {
@@ -228,9 +231,10 @@ async function sendOrdersToBostaBulk(req, res) {
         ...(Array.isArray(bostaResult?.data) ? bostaResult.data[i] : bostaResult),
       };
       const updated = await markOrderSentToBosta(
-        item.orderId,
+        item.localOrderId || item.orderId,
         singleResult,
         payloads[i],
+        { shippingIntegrationId: connection.id },
       );
       updatedOrders.push({
         orderId: item.orderId,
@@ -246,7 +250,6 @@ async function sendOrdersToBostaBulk(req, res) {
         failedOrders.length === 0
           ? `${updatedOrders.length} orders processed successfully`
           : `${updatedOrders.length} orders sent, ${failedOrders.length} failed inventory/mapping checks`,
-      webhookUrl: await getWebhookUrl(),
       bosta: bostaResult,
       data: updatedOrders,
       failedOrders,
@@ -273,18 +276,13 @@ async function sendOrdersToBostaBulk(req, res) {
     if (error.code === "BOSTA_API_ERROR") {
       res.status(error.status || 502).json({
         success: false,
-        message: error.message,
-        errors: error.details?.errors || [error.message],
-        details: error.details,
+        message: shouldExposeErrorDetails() ? error.message : "Bosta request failed",
+        code: error.code,
       });
       return;
     }
 
-    res.status(500).json({
-      success: false,
-      message: "Failed to send orders to Bosta",
-      error: error.message,
-    });
+    sendInternalError(res, "Request failed", error, "bosta");
   }
 }
 
@@ -343,11 +341,7 @@ async function handleBostaOrderStatusWebhook(req, res) {
       res.status(404).json({ success: false, message: error.message });
       return;
     }
-    res.status(500).json({
-      success: false,
-      message: "Failed to process Bosta webhook",
-      error: error.message,
-    });
+    sendInternalError(res, "Request failed", error, "bosta");
   }
 }
 

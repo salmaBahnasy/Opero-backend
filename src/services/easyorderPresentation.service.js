@@ -178,7 +178,13 @@ function toPresentation(payload) {
         : null;
 
   return {
-    id: order.id,
+    id: order.localOrderId || order.orderRowId || order.id,
+    localOrderId: order.localOrderId || order.orderRowId || order.id,
+    orderRowId: order.orderRowId || order.localOrderId || order.id,
+    order_id: order.order_id || order.sourceOrderId || null,
+    sourceOrderId: order.sourceOrderId || order.order_id || null,
+    order_reference: order.order_reference ?? order.orderReference ?? null,
+    orderReference: order.order_reference ?? order.orderReference ?? null,
     shortId: order.short_id ?? order.shortId,
     status: order.status,
     is_manual: isManual,
@@ -247,6 +253,30 @@ function toPresentation(payload) {
     tracking: formatTracking(order.metadata),
     storeId: order.store_id,
     guestId: order.guest_id,
+    source_integration_id:
+      order.source_integration_id ??
+      payload.source_integration_id ??
+      order.sourceIntegrationId ??
+      payload.sourceIntegrationId ??
+      null,
+    sourceIntegrationId:
+      order.sourceIntegrationId ??
+      payload.sourceIntegrationId ??
+      order.source_integration_id ??
+      payload.source_integration_id ??
+      null,
+    shipping_integration_id:
+      order.shipping_integration_id ??
+      payload.shipping_integration_id ??
+      order.shippingIntegrationId ??
+      payload.shippingIntegrationId ??
+      null,
+    shippingIntegrationId:
+      order.shippingIntegrationId ??
+      payload.shippingIntegrationId ??
+      order.shipping_integration_id ??
+      payload.shipping_integration_id ??
+      null,
     orderMeta: {
       orderSource: orderSource || null,
       orderType: orderType || null,

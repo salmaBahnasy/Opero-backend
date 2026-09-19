@@ -1,5 +1,8 @@
 const CATEGORIES = ["commerce", "shipping"];
 
+const REMOTE_PRODUCT_SYNC_PROVIDERS = ["easyorders", "shopify", "salla"];
+const HISTORICAL_API_IMPORT_PROVIDERS = ["shopify", "salla"];
+
 const PROVIDERS = {
   easyorders: {
     provider: "easyorders",
@@ -18,6 +21,13 @@ const PROVIDERS = {
     category: "commerce",
     webhookSuffix: "orders",
     secretKeys: ["accessToken", "access_token", "apiKey", "api_key"],
+  },
+  spreadsheet: {
+    provider: "spreadsheet",
+    category: "commerce",
+    ingestionOnly: true,
+    webhookSuffix: null,
+    secretKeys: [],
   },
   bosta: {
     provider: "bosta",
@@ -82,19 +92,41 @@ function assertProviderCategory(provider, category) {
   return def;
 }
 
+function isIngestionOnlyProvider(provider) {
+  return getProviderDefinition(provider)?.ingestionOnly === true;
+}
+
+function isRemoteProductSyncProvider(provider) {
+  return REMOTE_PRODUCT_SYNC_PROVIDERS.includes(normalizeProvider(provider));
+}
+
+function isHistoricalApiImportProvider(provider) {
+  return HISTORICAL_API_IMPORT_PROVIDERS.includes(normalizeProvider(provider));
+}
+
 function webhookPath(provider, token) {
   const def = assertProvider(provider);
+  if (def.ingestionOnly || !def.webhookSuffix) {
+    const error = new Error("Historical spreadsheet sources do not use webhooks");
+    error.code = "SPREADSHEET_WEBHOOK_UNSUPPORTED";
+    throw error;
+  }
   return `/webhooks/${def.provider}/${encodeURIComponent(token)}/${def.webhookSuffix}`;
 }
 
 module.exports = {
   CATEGORIES,
   PROVIDERS,
+  REMOTE_PRODUCT_SYNC_PROVIDERS,
+  HISTORICAL_API_IMPORT_PROVIDERS,
   normalizeProvider,
   normalizeCategory,
   getProviderDefinition,
   assertProvider,
   assertCategory,
   assertProviderCategory,
+  isIngestionOnlyProvider,
+  isRemoteProductSyncProvider,
+  isHistoricalApiImportProvider,
   webhookPath,
 };

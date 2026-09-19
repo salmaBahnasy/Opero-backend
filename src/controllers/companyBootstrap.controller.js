@@ -1,4 +1,5 @@
 const { getCompanyBootstrap } = require("../services/companyBootstrap.service");
+const { sendInternalError } = require("../utils/safeError");
 
 function handleBootstrapError(res, error) {
   if (error.code === "TENANT_CONTEXT_MISSING") {
@@ -13,7 +14,7 @@ function handleBootstrapError(res, error) {
     res.status(403).json({
       success: false,
       code: error.code,
-      message: error.message,
+      message: "Account is inactive.",
     });
     return;
   }
@@ -21,15 +22,11 @@ function handleBootstrapError(res, error) {
     res.status(404).json({
       success: false,
       code: error.code,
-      message: error.message,
+      message: "Not found",
     });
     return;
   }
-  res.status(500).json({
-    success: false,
-    message: "Failed to load company bootstrap",
-    error: error.message,
-  });
+  sendInternalError(res, "Failed to load company bootstrap", error, "bootstrap");
 }
 
 async function getBootstrap(req, res) {

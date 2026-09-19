@@ -229,6 +229,36 @@ function seedClient() {
         credentials: encryptJson({ apiKey: "SHOULD_NEVER_APPEAR" }),
       },
       {
+        id: "int-enaya-old-erp",
+        company_id: ENAYA_ID,
+        category: "commerce",
+        provider: "spreadsheet",
+        name: "Old ERP",
+        is_enabled: true,
+        credentials: encryptJson({}),
+        settings: {},
+      },
+      {
+        id: "int-enaya-prev-store",
+        company_id: ENAYA_ID,
+        category: "commerce",
+        provider: "spreadsheet",
+        name: "Previous Store",
+        is_enabled: false,
+        credentials: encryptJson({}),
+        settings: {},
+      },
+      {
+        id: "int-enaya-shop-off",
+        company_id: ENAYA_ID,
+        category: "commerce",
+        provider: "shopify",
+        name: "Shopify Disabled",
+        is_enabled: false,
+        credentials: encryptJson({ accessToken: "shpat-disabled" }),
+        settings: { shopDomain: "enaya-off.myshopify.com" },
+      },
+      {
         id: "int-other-eo",
         company_id: OTHER_ID,
         category: "commerce",
@@ -402,6 +432,38 @@ describe("company bootstrap and public branding", () => {
       ...json.data.integrations.shipping,
     ].map((row) => row.name);
     assert.equal(names.includes("Mylerz Disabled"), false);
+    assert.equal(names.includes("Shopify Disabled"), false);
+    assert.equal(names.includes("Previous Store"), false);
+  });
+
+  it("keeps disabled and spreadsheet sources in label metadata without making them operational", async () => {
+    const { json } = await request("GET", "/api/company/bootstrap", {
+      token: enayaToken(),
+    });
+    const commerceNames = json.data.integrations.commerce.map((row) => row.name);
+    const sourceNames = json.data.integrations.sources.map((row) => row.name);
+    assert.equal(commerceNames.includes("Old ERP"), false);
+    assert.equal(commerceNames.includes("Previous Store"), false);
+    assert.equal(commerceNames.includes("Shopify Disabled"), false);
+    assert.equal(sourceNames.includes("Old ERP"), true);
+    assert.equal(sourceNames.includes("Previous Store"), true);
+    assert.equal(sourceNames.includes("Shopify Disabled"), true);
+    assert.equal(sourceNames.includes("EasyOrders Egypt"), true);
+    const oldErp = json.data.integrations.sources.find((row) => row.name === "Old ERP");
+    const previous = json.data.integrations.sources.find((row) => row.name === "Previous Store");
+    assert.equal(oldErp.provider, "spreadsheet");
+    assert.equal(oldErp.enabled, true);
+    assert.equal(previous.enabled, false);
+    for (const row of json.data.integrations.sources) {
+      assert.deepEqual(Object.keys(row).sort(), [
+        "category",
+        "enabled",
+        "id",
+        "name",
+        "provider",
+      ]);
+    }
+    assertNoSecrets(json);
   });
 
   it("does not expose credentials, tokens, webhook URLs, or shopDomain", async () => {

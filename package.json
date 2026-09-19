@@ -3,14 +3,19 @@
   "version": "1.0.0",
   "description": "",
   "main": "index.js",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
-    "test": "node --test --test-concurrency=1 tests/auth.tenant.test.js tests/jwt.config.test.js tests/tenant.isolation.test.js tests/platform.integrations.test.js tests/company.bootstrap.test.js",
+    "test": "node --test --test-concurrency=1 tests/auth.tenant.test.js tests/jwt.config.test.js tests/tenant.isolation.test.js tests/platform.integrations.test.js tests/platform.company.ops.test.js tests/company.bootstrap.test.js tests/company.integrations.test.js tests/bosta.shipping.test.js tests/easyconfirm.test.js tests/orders.identity.test.js tests/shopify.domain.test.js tests/shopify.adapter.test.js tests/shopify.orders.test.js tests/shopify.products.test.js tests/shopify.ux.test.js tests/shopify.import.test.js tests/salla.oauth.test.js tests/salla.orders.test.js tests/salla.products.test.js tests/salla.import.test.js tests/salla.hardening.test.js tests/import.sources.test.js tests/catalog.backfill.test.js tests/easyorder.catalog.enrichment.test.js tests/catalog.planning.adapter.test.js tests/catalog.writer.test.js tests/catalog.write.rpc.test.js tests/catalog.writer.rpc.adapter.test.js tests/shopify.catalog.dualwrite.test.js tests/signup.company.workspace.rpc.test.js tests/public.signup.test.js tests/analytics.test.js tests/security.mvp.test.js tests/performance.mvp.test.js tests/qa.mvp.test.js tests/deployment.prep.test.js",
     "dev": "nodemon src/server.js",
     "start": "node src/server.js",
+    "bootstrap:platform-admin": "node scripts/bootstrap-platform-admin.js --confirm",
     "delete-all-orders": "node scripts/delete-all-orders.js",
     "bosta-locations:sql": "node scripts/setup-bosta-locations-tables.js",
     "backfill-order-references": "node scripts/backfill-order-references.js --yes",
-    "backfill-customer-status": "node scripts/backfill-customer-status-from-easyorders.js --yes"
+    "backfill-customer-status": "node scripts/backfill-customer-status-from-easyorders.js --yes",
+    "catalog-backfill:dry-run": "node scripts/catalog-backfill.js --dry-run"
   },
   "keywords": [],
   "author": "",
@@ -24,7 +29,9 @@
     "csvtojson": "^2.0.14",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
+    "express-rate-limit": "^7.5.1",
     "googleapis": "^171.4.0",
+    "helmet": "^7.2.0",
     "jsonwebtoken": "^9.0.3",
     "xlsx": "^0.18.5"
   },

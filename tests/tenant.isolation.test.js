@@ -24,6 +24,8 @@ const ENAYA_ID = "11111111-1111-4111-8111-111111111111";
 const OTHER_ID = "22222222-2222-4222-8222-222222222222";
 const ENAYA_ADMIN_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const OTHER_ADMIN_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+const ENAYA_BOSTA_ID = "b1111111-1111-4111-8111-111111111111";
+const OTHER_BOSTA_ID = "b2222222-2222-4222-8222-222222222222";
 const SHARED_ORDER_ID = "shared-external-order";
 const SHARED_REF = 1001;
 const SHARED_EASYORDER_ID = "shared-easyorder-product";
@@ -215,18 +217,50 @@ function seedClient() {
       {
         id: "map-enaya",
         company_id: ENAYA_ID,
+        shipping_integration_id: ENAYA_BOSTA_ID,
+        catalog_product_id: "prod-enaya",
         mapping_type: "product",
-        entity_id: SHARED_EASYORDER_ID,
+        entity_id: "prod-enaya",
         name: "Enaya map",
         skus: ["ENA-SKU"],
       },
       {
-        id: "map-other",
-        company_id: OTHER_ID,
+        id: "map-enaya-legacy",
+        company_id: ENAYA_ID,
+        shipping_integration_id: null,
+        catalog_product_id: null,
         mapping_type: "product",
         entity_id: SHARED_EASYORDER_ID,
+        name: "Enaya legacy map",
+        skus: ["ENA-LEGACY"],
+      },
+      {
+        id: "map-other",
+        company_id: OTHER_ID,
+        shipping_integration_id: OTHER_BOSTA_ID,
+        catalog_product_id: "prod-other",
+        mapping_type: "product",
+        entity_id: "prod-other",
         name: "Other map",
         skus: ["OTH-SKU"],
+      },
+    ],
+    company_integrations: [
+      {
+        id: ENAYA_BOSTA_ID,
+        company_id: ENAYA_ID,
+        provider: "bosta",
+        category: "shipping",
+        name: "Enaya Bosta",
+        is_enabled: true,
+      },
+      {
+        id: OTHER_BOSTA_ID,
+        company_id: OTHER_ID,
+        provider: "bosta",
+        category: "shipping",
+        name: "Other Bosta",
+        is_enabled: true,
       },
     ],
   });
@@ -361,6 +395,48 @@ describe("tenant isolation", () => {
     assert.equal(enaya.company_id, ENAYA_ID);
   });
 
+  it("H2. HTTP update/delete cannot reach another company's product", async () => {
+    const patched = await request("PATCH", "/api/products/prod-other", {
+      token: enayaToken(),
+      body: { name: "Stolen", sku: "X", price: 1, companyId: OTHER_ID },
+    });
+    assert.equal(patched.status, 404);
+    assert.equal(fake.__db.products.find((row) => row.id === "prod-other").name, "Other Product");
+
+    const deleted = await request("DELETE", "/api/products/prod-other", {
+      token: enayaToken(),
+    });
+    assert.equal(deleted.status, 404);
+    assert.equal(fake.__db.products.some((row) => row.id === "prod-other"), true);
+  });
+
+  it("H3. body/query companyId cannot create or list products in another company", async () => {
+    const created = await request("POST", "/api/products", {
+      token: enayaToken(),
+      body: {
+        companyId: OTHER_ID,
+        company_id: OTHER_ID,
+        name: "Local Cream",
+        sku: "LOCAL-CREAM",
+        price: 50,
+        quantity: 3,
+      },
+    });
+    assert.equal(created.status, 201, created.json?.message);
+    assert.equal(created.json.data.source_integration_id, null);
+    const inserted = fake.__db.products.find((row) => row.sku === "LOCAL-CREAM");
+    assert.ok(inserted);
+    assert.equal(inserted.company_id, ENAYA_ID);
+
+    const listed = await request("GET", `/api/products?companyId=${OTHER_ID}`, {
+      token: enayaToken(),
+    });
+    assert.equal(listed.status, 200);
+    const names = (listed.json.data || []).map((row) => row.name);
+    assert.equal(names.includes("Local Cream"), true);
+    assert.equal(names.includes("Other Product"), false);
+  });
+
   it("I. added orders are tenant isolated", async () => {
     const a = await request("GET", "/api/added-orders", { token: enayaToken() });
     assert.equal(a.status, 200);
@@ -428,14 +504,24 @@ describe("tenant isolation", () => {
       token: enayaToken(),
     });
     assert.equal(a.status, 200);
-    assert.equal(a.json.data.productSkuMap[SHARED_EASYORDER_ID].name, "Enaya map");
-    assert.equal(a.json.data.productSkuMap[SHARED_EASYORDER_ID].skus[0], "ENA-SKU");
+    assert.equal(a.json.data.productSkuMap["prod-enaya"].name, "Enaya map");
+    assert.equal(a.json.data.productSkuMap["prod-enaya"].skus[0], "ENA-SKU");
+    assert.equal(a.json.data.productSkuMap[SHARED_EASYORDER_ID], undefined);
+    assert.equal(
+      (a.json.data.legacyMappings || []).some((row) => row.name === "Enaya legacy map"),
+      true,
+    );
+    assert.equal(
+      Object.values(a.json.data.productSkuMap || {}).some((row) => row.name === "Other map"),
+      false,
+    );
 
     const b = await request("GET", "/api/bosta/sku-mappings", {
       token: otherToken(),
     });
     assert.equal(b.status, 200);
-    assert.equal(b.json.data.productSkuMap[SHARED_EASYORDER_ID].name, "Other map");
+    assert.equal(b.json.data.productSkuMap["prod-other"].name, "Other map");
+    assert.equal(b.json.data.productSkuMap["prod-enaya"], undefined);
   });
 
   it("M. dashboard/statistics cache cannot leak between companies", async () => {

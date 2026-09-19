@@ -79,4 +79,17 @@ describe("JWT configuration", () => {
       return true;
     });
   });
+
+  it("rejects tokens that are not HS256", () => {
+    const jwt = require("jsonwebtoken");
+    const payload = {
+      employeeId: "emp-1",
+      companyId: "co-1",
+      role: "company_admin",
+      email: "a@b.c",
+      scope: "company",
+    };
+    const hs384 = jwt.sign(payload, process.env.JWT_SECRET, { algorithm: "HS384" });
+    assert.throws(() => verifyEmployeeToken(hs384));
+  });
 });

@@ -9,24 +9,31 @@ const {
 const {
   listBostaSkuMappings,
   getBostaSkuMappingHandler,
+  getBostaSkuMappingByIdHandler,
   getBostaSkuOptionsByProductHandler,
   addBostaSkuMappingHandler,
   updateBostaSkuMappingHandler,
+  updateBostaSkuMappingByIdHandler,
   deleteBostaSkuMappingHandler,
+  deleteBostaSkuMappingByIdHandler,
   deleteUnmappedProductHandler,
   importBostaSkuMappingsHandler,
 } = require("../controllers/bostaSkuMappings.controller");
 const { checkBostaFulfillmentHealth } = require("../controllers/bostaFulfillment.controller");
 const { requireAuth } = require("../middlewares/auth.middleware");
 const { bindTenantScope } = require("../middlewares/tenant.middleware");
+const { requireCompanyFeature } = require("../middlewares/feature.middleware");
+const { requirePlatformAdmin } = require("../middlewares/platformAuth.middleware");
 
 const router = express.Router();
-const requireTenant = [requireAuth, bindTenantScope];
+const requireTenant = [
+  requireAuth,
+  bindTenantScope,
+  requireCompanyFeature("bosta"),
+];
 
-/** Test Bosta x-api-key on this server (Render vs local). */
 router.get("/fulfillment/health", ...requireTenant, checkBostaFulfillmentHealth);
 
-/** SKU mappings: product / variant / size → Bosta sku codes */
 router.get("/sku-mappings", ...requireTenant, listBostaSkuMappings);
 router.post("/sku-mappings/import", ...requireTenant, importBostaSkuMappingsHandler);
 router.post("/sku-mappings", ...requireTenant, addBostaSkuMappingHandler);
@@ -36,10 +43,14 @@ router.delete(
   deleteUnmappedProductHandler,
 );
 router.get(
-  "/sku-mappings/by-product/:productId",
+  "/sku-mappings/by-product/:catalogProductId",
   ...requireTenant,
   getBostaSkuOptionsByProductHandler,
 );
+router.get("/sku-mappings/rows/:mappingId", ...requireTenant, getBostaSkuMappingByIdHandler);
+router.put("/sku-mappings/rows/:mappingId", ...requireTenant, updateBostaSkuMappingByIdHandler);
+router.patch("/sku-mappings/rows/:mappingId", ...requireTenant, updateBostaSkuMappingByIdHandler);
+router.delete("/sku-mappings/rows/:mappingId", ...requireTenant, deleteBostaSkuMappingByIdHandler);
 router.get("/sku-mappings/:mappingType/:entityId", ...requireTenant, getBostaSkuMappingHandler);
 router.put(
   "/sku-mappings/:mappingType/:entityId",
@@ -57,28 +68,26 @@ router.delete(
   deleteBostaSkuMappingHandler,
 );
 
-/** Pull cities + districts from Bosta API v2 and upsert into Supabase (same Bosta ids). */
-router.post("/locations/sync", syncLocations);
+router.get("/unmapped-products", ...requireTenant, listBostaSkuMappings);
+router.delete(
+  "/unmapped-products/:productId",
+  ...requireTenant,
+  deleteUnmappedProductHandler,
+);
+
+router.post("/locations/sync", requirePlatformAdmin, syncLocations);
 router.get("/locations/sync", (req, res) => {
   res.status(405).json({
     success: false,
     message:
-      "Sync requires POST (not GET). In Postman set method to POST, then send again.",
+      "Sync requires POST as a platform admin. In Postman set method to POST with a platform JWT.",
     useMethod: "POST",
-    paths: [
-      "/api/bosta/locations/sync",
-      "/api/easyorder/bosta/locations/sync",
-    ],
+    paths: ["/api/bosta/locations/sync"],
   });
 });
 
-/** Governorates (cities) — optional ?q= or ?search= (Arabic/English name, alias, code). */
-router.get("/cities", listCities);
-
-/** Districts for a city — optional ?q= or ?search= (district/zone names AR/EN). */
-router.get("/cities/:cityId/districts", listDistricts);
-
-/** Zones grouped with districts (districtId on each item) — optional ?q= */
-router.get("/cities/:cityId/zones", listZones);
+router.get("/cities", ...requireTenant, listCities);
+router.get("/cities/:cityId/districts", ...requireTenant, listDistricts);
+router.get("/cities/:cityId/zones", ...requireTenant, listZones);
 
 module.exports = router;

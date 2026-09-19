@@ -279,6 +279,125 @@ function resolveEasyOrderDateRange(req) {
   return { from, to, usedDefault: false };
 }
 
+function getEgyptTodayRange(now = new Date()) {
+  return getEgyptDayRange(getEgyptCalendarDateKey(now));
+}
+
+function getEgyptYesterdayRange(now = new Date()) {
+  const p = getZonedParts(now);
+  const y = addEgyptCalendarDays(p.year, p.month, p.day, -1);
+  return getEgyptDayRange(formatYmd(y.year, y.month, y.day));
+}
+
+function getEgyptInclusiveLastDaysRange(days, now = new Date()) {
+  const n = Math.max(1, Number(days) || 1);
+  const egyptNow = getZonedParts(now);
+  const start = addEgyptCalendarDays(
+    egyptNow.year,
+    egyptNow.month,
+    egyptNow.day,
+    -(n - 1),
+  );
+  return {
+    from: egyptLocalToUtc(start.year, start.month, start.day, 0, 0, 0, 0),
+    to: egyptLocalToUtc(
+      egyptNow.year,
+      egyptNow.month,
+      egyptNow.day,
+      23,
+      59,
+      59,
+      999,
+    ),
+  };
+}
+
+function daysInEgyptMonth(year, month) {
+  const nextMonth = month === 12 ? 1 : month + 1;
+  const nextYear = month === 12 ? year + 1 : year;
+  const firstNext = egyptLocalToUtc(nextYear, nextMonth, 1, 0, 0, 0, 0);
+  const last = new Date(firstNext.getTime() - 1);
+  return getZonedParts(last).day;
+}
+
+function getEgyptThisMonthRange(now = new Date()) {
+  const p = getZonedParts(now);
+  return {
+    from: egyptLocalToUtc(p.year, p.month, 1, 0, 0, 0, 0),
+    to: egyptLocalToUtc(p.year, p.month, p.day, 23, 59, 59, 999),
+  };
+}
+
+function getEgyptLastCalendarMonthRange(now = new Date()) {
+  const p = getZonedParts(now);
+  const month = p.month === 1 ? 12 : p.month - 1;
+  const year = p.month === 1 ? p.year - 1 : p.year;
+  const lastDay = daysInEgyptMonth(year, month);
+  return {
+    from: egyptLocalToUtc(year, month, 1, 0, 0, 0, 0),
+    to: egyptLocalToUtc(year, month, lastDay, 23, 59, 59, 999),
+  };
+}
+
+function previousCalendarMonthMtd(from, to) {
+  const start = getZonedParts(from);
+  const end = getZonedParts(to);
+  const month = start.month === 1 ? 12 : start.month - 1;
+  const year = start.month === 1 ? start.year - 1 : start.year;
+  const lastDay = daysInEgyptMonth(year, month);
+  const mtdDay = Math.min(end.day, lastDay);
+  return {
+    from: egyptLocalToUtc(year, month, 1, 0, 0, 0, 0),
+    to: egyptLocalToUtc(year, month, mtdDay, 23, 59, 59, 999),
+  };
+}
+
+function previousFullCalendarMonth(from) {
+  const start = getZonedParts(from);
+  const month = start.month === 1 ? 12 : start.month - 1;
+  const year = start.month === 1 ? start.year - 1 : start.year;
+  const lastDay = daysInEgyptMonth(year, month);
+  return {
+    from: egyptLocalToUtc(year, month, 1, 0, 0, 0, 0),
+    to: egyptLocalToUtc(year, month, lastDay, 23, 59, 59, 999),
+  };
+}
+
+function previousEqualDurationRange(from, to) {
+  const durationMs = Math.max(0, to.getTime() - from.getTime());
+  const prevTo = new Date(from.getTime() - 1);
+  const prevFrom = new Date(prevTo.getTime() - durationMs);
+  return { from: prevFrom, to: prevTo };
+}
+
+function resolveEgyptPresetRange(preset, now = new Date()) {
+  const key = String(preset || "").trim();
+  if (key === "today") return getEgyptTodayRange(now);
+  if (key === "yesterday") return getEgyptYesterdayRange(now);
+  if (key === "last_7_days" || key === "7d") {
+    return getEgyptInclusiveLastDaysRange(7, now);
+  }
+  if (key === "last_30_days" || key === "30d") {
+    return getEgyptInclusiveLastDaysRange(30, now);
+  }
+  if (key === "this_month" || key === "month") {
+    return getEgyptThisMonthRange(now);
+  }
+  if (key === "last_month") return getEgyptLastCalendarMonthRange(now);
+  return null;
+}
+
+function previousEquivalentRange({ preset, from, to }) {
+  const key = String(preset || "").trim();
+  if (key === "this_month" || key === "month") {
+    return previousCalendarMonthMtd(from, to);
+  }
+  if (key === "last_month") {
+    return previousFullCalendarMonth(from);
+  }
+  return previousEqualDurationRange(from, to);
+}
+
 module.exports = {
   EGYPT_TIMEZONE,
   getEgyptMonthToDateRange,
@@ -291,4 +410,12 @@ module.exports = {
   egyptLocalToUtc,
   isEasyOrderApiRequest,
   resolveEasyOrderDateRange,
+  getEgyptTodayRange,
+  getEgyptYesterdayRange,
+  getEgyptInclusiveLastDaysRange,
+  getEgyptThisMonthRange,
+  getEgyptLastCalendarMonthRange,
+  resolveEgyptPresetRange,
+  previousEquivalentRange,
+  getZonedParts,
 };

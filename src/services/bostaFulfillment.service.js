@@ -14,7 +14,9 @@ function getFulfillmentBaseUrl() {
 }
 
 async function getWebhookUrl() {
-  const { row, secrets } = await getTenantProviderSecrets("bosta");
+  const { row, secrets } = await getTenantProviderSecrets("bosta", {
+    category: "shipping",
+  });
   const token = decryptWebhookToken(row);
   if (token) {
     return buildWebhookUrl("bosta", token);
@@ -45,7 +47,9 @@ function isFulfillmentApiKey(apiKey) {
 }
 
 async function resolveFulfillmentApiKey() {
-  const { secrets } = await getTenantProviderSecrets("bosta");
+  const { secrets } = await getTenantProviderSecrets("bosta", {
+    category: "shipping",
+  });
   const fulfillmentKey = normalizeFulfillmentApiKey(secrets.fulfillmentApiKey);
   if (fulfillmentKey) return fulfillmentKey;
   const shippingKey = normalizeFulfillmentApiKey(secrets.apiKey);

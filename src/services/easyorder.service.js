@@ -1,17 +1,44 @@
 const axios = require("axios");
-const { getTenantProviderSecrets } = require("./companyIntegrations.service");
 
-const DEFAULT_EASYORDER_API_BASE =
-  "https://api.easy-orders.net/api/v1/external-apps";
+const EASYORDERS_TIMEOUT_MS = 15000;
+const {
+  getConnection,
+  getTenantProviderSecrets,
+} = require("./companyIntegrations.service");
+const { requireActiveCompanyId } = require("../utils/tenantScope");
+const { getTrustedEasyOrdersApiBaseUrl } = require("../config/easyorders");
+
+function sourceIntegrationIdFromOrder(order) {
+  const id = String(
+    order?.source_integration_id ?? order?.sourceIntegrationId ?? "",
+  ).trim();
+  return id || null;
+}
+
+function easyConfirmSourceRequired() {
+  const err = new Error(
+    "This order has no EasyOrders commerce source. EasyConfirm cannot guess a store.",
+  );
+  err.code = "EASYCONFIRM_SOURCE_REQUIRED";
+  err.statusCode = 409;
+  return err;
+}
+
+function easyConfirmNotEasyOrders() {
+  const err = new Error(
+    "This order is not sourced from EasyOrders. EasyConfirm is EasyOrders-specific.",
+  );
+  err.code = "EASYCONFIRM_NOT_EASYORDERS";
+  err.statusCode = 409;
+  return err;
+}
 
 async function getEasyOrdersClient(options = {}) {
   const { secrets } = await getTenantProviderSecrets("easyorders", options);
   const apiKey = String(secrets.apiKey || "").trim();
-  const baseUrl = (
-    secrets.apiBaseUrl ||
-    process.env.EASYORDER_API_BASE_URL ||
-    DEFAULT_EASYORDER_API_BASE
-  ).replace(/\/$/, "");
+  void secrets.apiBaseUrl;
+  void secrets.api_base_url;
+  const baseUrl = getTrustedEasyOrdersApiBaseUrl();
 
   return {
     apiKey,
@@ -20,11 +47,42 @@ async function getEasyOrdersClient(options = {}) {
   };
 }
 
+async function getEasyOrdersClientForOrder(order, { required = false } = {}) {
+  const sourceId = sourceIntegrationIdFromOrder(order);
+  if (!sourceId) {
+    if (required) throw easyConfirmSourceRequired();
+    return null;
+  }
+
+  const companyId = requireActiveCompanyId();
+  let connection;
+  try {
+    connection = await getConnection(companyId, sourceId);
+  } catch (error) {
+    if (!required && error.code === "INTEGRATION_NOT_FOUND") {
+      return null;
+    }
+    throw error;
+  }
+
+  if (String(connection.provider || "").toLowerCase() !== "easyorders") {
+    if (required) throw easyConfirmNotEasyOrders();
+    return null;
+  }
+
+  return getEasyOrdersClient({
+    integrationId: sourceId,
+    category: "commerce",
+  });
+}
+
 async function getOrderById(orderId, options = {}) {
-  const client = await getEasyOrdersClient(options);
-  const url = `${client.baseUrl}/orders/${orderId}`;
+  const client = options.client || (await getEasyOrdersClient(options));
+  const url = `${client.baseUrl}/orders/${encodeURIComponent(String(orderId || "").trim())}`;
   const response = await axios.get(url, {
     headers: client.headers,
+    timeout: EASYORDERS_TIMEOUT_MS,
+    maxRedirects: 0,
   });
   return response.data;
 }
@@ -85,21 +143,43 @@ async function enrichOrderWithEasyOrdersCustomerStatus(order, options = {}) {
   const syncLocal = options.syncLocal !== false;
   const forceSync = options.forceSync === true;
   const orderId = String(
-    order.sourceOrderId || order.id || order.order_id || "",
+    order.sourceOrderId || order.order_id || "",
   ).trim();
   if (!orderId) {
     return { order, easyOrdersConfirm: null };
   }
 
+  let client;
+  try {
+    client = await getEasyOrdersClientForOrder(order, {
+      required: options.throwOnError === true,
+    });
+  } catch (error) {
+    if (options.throwOnError) throw error;
+    return { order, easyOrdersConfirm: null };
+  }
+  if (!client) {
+    return { order, easyOrdersConfirm: null };
+  }
+
   let remote;
   try {
-    remote = await getOrderById(orderId);
+    remote = await getOrderById(orderId, { client });
   } catch (error) {
     if (
       error?.code === "INTEGRATION_NOT_CONFIGURED" ||
-      error?.code === "INTEGRATION_DISABLED"
+      error?.code === "INTEGRATION_DISABLED" ||
+      error?.code === "INTEGRATION_NOT_OWNED" ||
+      error?.code === "INTEGRATION_NOT_FOUND" ||
+      error?.code === "INTEGRATION_AMBIGUOUS" ||
+      error?.code === "PROVIDER_MISMATCH" ||
+      error?.code === "EASYCONFIRM_SOURCE_REQUIRED" ||
+      error?.code === "EASYCONFIRM_NOT_EASYORDERS"
     ) {
-      if (options.throwOnError) throw error;
+      if (options.throwOnError) {
+        if (error.code === "PROVIDER_MISMATCH") throw easyConfirmNotEasyOrders();
+        throw error;
+      }
       return { order, easyOrdersConfirm: null };
     }
     console.warn(
@@ -175,7 +255,7 @@ async function enrichOrderWithEasyOrdersCustomerStatus(order, options = {}) {
 
   if (shouldWrite) {
     const { mergeOrderRawDataPatch } = require("./webhookOrders.service");
-    enriched = await mergeOrderRawDataPatch(order.sourceOrderId, {
+    enriched = await mergeOrderRawDataPatch(order.localOrderId || order.sourceOrderId, {
       customer_status: customerStatus,
       customerStatus,
       easyorders_status: remoteOrder.status,
@@ -190,7 +270,7 @@ async function enrichOrderWithEasyOrdersCustomerStatus(order, options = {}) {
   return { order: enriched, easyOrdersConfirm };
 }
 
-async function refreshCustomerStatusFromEasyOrders(orderId) {
+async function refreshCustomerStatusFromEasyOrders(orderId, lookupOptions = {}) {
   const id = String(orderId || "").trim();
   if (!id) {
     const err = new Error("order id is required");
@@ -200,16 +280,7 @@ async function refreshCustomerStatusFromEasyOrders(orderId) {
   }
 
   const { getWebhookOrderById } = require("./webhookOrders.service");
-  let localOrder;
-  try {
-    localOrder = await getWebhookOrderById(id);
-  } catch (error) {
-    if (error.code === "ORDER_NOT_FOUND") {
-      localOrder = { sourceOrderId: id, id };
-    } else {
-      throw error;
-    }
-  }
+  const localOrder = await getWebhookOrderById(id, lookupOptions);
 
   if (isManualOrder(localOrder)) {
     const err = new Error(
@@ -227,7 +298,7 @@ async function refreshCustomerStatusFromEasyOrders(orderId) {
     await enrichOrderWithEasyOrdersCustomerStatus(
       {
         ...localOrder,
-        sourceOrderId: localOrder.sourceOrderId || id,
+        sourceOrderId: localOrder.sourceOrderId || localOrder.order_id || "",
       },
       { syncLocal: true, forceSync: true, throwOnError: true },
     );
@@ -252,6 +323,8 @@ async function getProductsFromEasyOrder(options = {}) {
   const url = `${client.baseUrl}/products`;
   const response = await axios.get(url, {
     headers: client.headers,
+    timeout: EASYORDERS_TIMEOUT_MS,
+    maxRedirects: 0,
   });
   return response.data;
 }
@@ -269,11 +342,14 @@ async function getProductById(productId, options = {}) {
   const url = `${client.baseUrl}/products/${encodeURIComponent(id)}`;
   const response = await axios.get(url, {
     headers: client.headers,
+    timeout: EASYORDERS_TIMEOUT_MS,
+    maxRedirects: 0,
   });
   return response.data;
 }
 
 module.exports = {
+  getEasyOrdersClient,
   getOrderById,
   getProductsFromEasyOrder,
   getProductById,
@@ -281,4 +357,6 @@ module.exports = {
   enrichOrderWithEasyOrdersCustomerStatus,
   refreshCustomerStatusFromEasyOrders,
   isManualOrder,
+  sourceIntegrationIdFromOrder,
+  EASYORDERS_TIMEOUT_MS,
 };

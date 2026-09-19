@@ -6,6 +6,7 @@ const {
   SAFE_INTEGRATION_COLUMNS,
   toBranding,
 } = require("../utils/branding");
+const { isIngestionOnlyProvider } = require("../integrations/catalog");
 
 const COMPANIES_TABLE = process.env.SUPABASE_COMPANIES_TABLE || "companies";
 const EMPLOYEES_TABLE = process.env.SUPABASE_EMPLOYEES_TABLE || "employees";
@@ -29,6 +30,18 @@ function toSafeIntegration(row) {
     name: row.name,
     enabled: Boolean(row.is_enabled),
   };
+}
+
+function isOperationalBootstrapIntegration(row) {
+  if (!row || row.is_enabled === false) return false;
+  if (isIngestionOnlyProvider(row.provider)) return false;
+  if (String(row.provider || "").toLowerCase() !== "salla") return true;
+  const settings = row.settings && typeof row.settings === "object" ? row.settings : {};
+  return String(settings.authorizationStatus || settings.authorization_status || "") === "connected";
+}
+
+function isSourceAttributionIntegration(row) {
+  return String(row?.category || "").toLowerCase() === "commerce";
 }
 
 async function loadCompany(companyId) {
@@ -110,18 +123,22 @@ async function loadIntegrations(companyId) {
   const { data, error } = await supabase
     .from(INTEGRATIONS_TABLE)
     .select(SAFE_INTEGRATION_COLUMNS)
-    .eq("company_id", companyId)
-    .eq("is_enabled", true);
+    .eq("company_id", companyId);
   if (error) throw new Error(error.message);
 
-  const grouped = { commerce: [], shipping: [] };
+  const grouped = { commerce: [], shipping: [], sources: [] };
   for (const row of data || []) {
     const item = toSafeIntegration(row);
+    if (isSourceAttributionIntegration(row)) {
+      grouped.sources.push(item);
+    }
+    if (!isOperationalBootstrapIntegration(row)) continue;
     if (item.category === "shipping") grouped.shipping.push(item);
     else if (item.category === "commerce") grouped.commerce.push(item);
   }
   grouped.commerce.sort((a, b) => String(a.name).localeCompare(String(b.name)));
   grouped.shipping.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+  grouped.sources.sort((a, b) => String(a.name).localeCompare(String(b.name)));
   return grouped;
 }
 
@@ -162,4 +179,5 @@ async function getCompanyBootstrap({ companyId, employeeId }) {
 
 module.exports = {
   getCompanyBootstrap,
+  loadFeatureMap,
 };

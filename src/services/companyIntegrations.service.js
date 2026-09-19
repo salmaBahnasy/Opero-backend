@@ -20,11 +20,20 @@ const {
   assertProviderCategory,
   assertProvider,
   getProviderDefinition,
+  isIngestionOnlyProvider,
 } = require("../integrations/catalog");
+
+function spreadsheetUnsupported(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  error.provider = "spreadsheet";
+  return error;
+}
 
 const INTEGRATIONS_TABLE =
   process.env.SUPABASE_COMPANY_INTEGRATIONS_TABLE || "company_integrations";
 const COMPANIES_TABLE = process.env.SUPABASE_COMPANIES_TABLE || "companies";
+const ORDERS_TABLE = process.env.SUPABASE_ORDERS_TABLE || "orders";
 
 function pickPrimarySecret(provider, secrets = {}) {
   const def = getProviderDefinition(provider);
@@ -38,6 +47,14 @@ function pickPrimarySecret(provider, secrets = {}) {
   return "";
 }
 
+function isMaskedSecretPlaceholder(value) {
+  const text = String(value || "").trim();
+  if (!text) return true;
+  if (/^\*+$/.test(text)) return true;
+  if (/^\*{4}.{1,8}$/.test(text)) return true;
+  return false;
+}
+
 function normalizeIncomingSecrets(provider, body = {}) {
   const credentials =
     body.credentials && typeof body.credentials === "object"
@@ -48,19 +65,23 @@ function normalizeIncomingSecrets(provider, body = {}) {
   const fulfillmentApiKey =
     credentials.fulfillmentApiKey ?? credentials.fulfillment_api_key;
   const accessToken = credentials.accessToken ?? credentials.access_token;
-  const apiBaseUrl = credentials.apiBaseUrl ?? credentials.api_base_url;
+  const webhookSecret =
+    credentials.webhookSecret ??
+    credentials.webhook_secret ??
+    credentials.clientSecret ??
+    credentials.apiSecret;
 
-  if (apiKey != null && String(apiKey).trim() !== "") {
+  if (apiKey != null && !isMaskedSecretPlaceholder(apiKey)) {
     secrets.apiKey = String(apiKey).trim();
   }
-  if (fulfillmentApiKey != null && String(fulfillmentApiKey).trim() !== "") {
+  if (fulfillmentApiKey != null && !isMaskedSecretPlaceholder(fulfillmentApiKey)) {
     secrets.fulfillmentApiKey = String(fulfillmentApiKey).trim();
   }
-  if (accessToken != null && String(accessToken).trim() !== "") {
+  if (accessToken != null && !isMaskedSecretPlaceholder(accessToken)) {
     secrets.accessToken = String(accessToken).trim();
   }
-  if (apiBaseUrl != null && String(apiBaseUrl).trim() !== "") {
-    secrets.apiBaseUrl = String(apiBaseUrl).trim().replace(/\/$/, "");
+  if (webhookSecret != null && !isMaskedSecretPlaceholder(webhookSecret)) {
+    secrets.webhookSecret = String(webhookSecret).trim();
   }
   return secrets;
 }
@@ -87,19 +108,59 @@ function pickShopDomain(body = {}) {
   );
 }
 
-function mergeConnectionSettings(existingSettings, body = {}) {
+function canonicalizeShopDomainForProvider(provider, shopDomain) {
+  if (!shopDomain) return shopDomain;
+  if (String(provider || "").toLowerCase() !== "shopify") return shopDomain;
+  const { normalizeShopifyShopDomain } = require("../utils/shopifyDomain");
+  return normalizeShopifyShopDomain(shopDomain);
+}
+
+function mergeConnectionSettings(existingSettings, body = {}, provider = null) {
   const current =
     existingSettings && typeof existingSettings === "object" ? { ...existingSettings } : {};
-  const incoming = body.settings && typeof body.settings === "object" ? body.settings : {};
+  const incoming =
+    body.settings && typeof body.settings === "object" ? { ...body.settings } : {};
+  delete incoming.apiKey;
+  delete incoming.api_key;
+  delete incoming.accessToken;
+  delete incoming.access_token;
+  delete incoming.fulfillmentApiKey;
+  delete incoming.fulfillment_api_key;
+  delete incoming.webhookSecret;
+  delete incoming.webhook_secret;
+  delete incoming.clientSecret;
+  delete incoming.apiSecret;
+  delete incoming.refreshToken;
+  delete incoming.refresh_token;
+  delete incoming.tokenType;
+  if (String(provider || "").toLowerCase() === "salla") {
+    delete incoming.authorizationStatus;
+    delete incoming.authorization_status;
+    delete incoming.tokenExpiresAt;
+    delete incoming.token_expires_at;
+    delete incoming.sallaOauth;
+    delete incoming.salla_oauth;
+    delete incoming.merchantName;
+    delete incoming.merchant_name;
+  }
   const settings = { ...current, ...incoming };
   const shopDomain = pickShopDomain(body);
-  if (shopDomain) settings.shopDomain = shopDomain;
+  if (shopDomain) {
+    settings.shopDomain = canonicalizeShopDomainForProvider(provider, shopDomain);
+  }
   delete settings.apiKey;
   delete settings.api_key;
   delete settings.accessToken;
   delete settings.access_token;
   delete settings.fulfillmentApiKey;
   delete settings.fulfillment_api_key;
+  delete settings.webhookSecret;
+  delete settings.webhook_secret;
+  delete settings.clientSecret;
+  delete settings.apiSecret;
+  delete settings.refreshToken;
+  delete settings.refresh_token;
+  delete settings.tokenType;
   return settings;
 }
 
@@ -147,15 +208,43 @@ function decryptWebhookToken(row) {
   }
 }
 
-function publicConnectionView(row, decryptedToken = null) {
+function sallaPublicFields(row, secrets = {}) {
+  if (String(row?.provider || "").toLowerCase() !== "salla") return {};
+  const {
+    classifySallaAuthorization,
+  } = require("./sallaAuth.service");
+  const settings =
+    row?.settings && typeof row.settings === "object" ? row.settings : {};
+  const authorizationStatus = classifySallaAuthorization(row, secrets);
+  return {
+    authorizationStatus,
+    merchantName: settings.merchantName || settings.merchant_name || null,
+    tokenExpiresAt: settings.tokenExpiresAt || settings.token_expires_at || null,
+  };
+}
+
+function publicConnectionView(row, revealedWebhookToken = null) {
   let secrets = {};
   try {
     secrets = decryptSecrets(row?.credentials);
   } catch {
     secrets = {};
   }
+  const ingestionOnly = isIngestionOnlyProvider(row?.provider);
   const primary = pickPrimarySecret(row?.provider, secrets);
-  const token = decryptedToken || decryptWebhookToken(row);
+  const salla = sallaPublicFields(row, secrets);
+  const webhookSecret = String(secrets.webhookSecret || secrets.webhook_secret || "").trim();
+  const revealedToken =
+    ingestionOnly || !revealedWebhookToken ? null : String(revealedWebhookToken);
+  const sallaConfigured = salla.authorizationStatus
+    ? salla.authorizationStatus === "connected"
+    : Boolean(primary);
+  const configured =
+    ingestionOnly
+      ? true
+      : String(row.provider || "").toLowerCase() === "salla"
+        ? sallaConfigured
+        : Boolean(primary);
   return {
     id: row.id,
     companyId: row.company_id,
@@ -163,15 +252,20 @@ function publicConnectionView(row, decryptedToken = null) {
     provider: row.provider,
     name: row.name,
     enabled: Boolean(row.is_enabled),
-    configured: Boolean(primary),
-    apiKeyMasked: maskSecret(primary),
-    providerAccountId: row.provider_account_id || null,
-    shopDomain: shopDomainFromRow(row, secrets),
-    webhookUrl: token ? buildWebhookUrl(row.provider, token) : null,
-    webhookConfigured: Boolean(row.webhook_token_hash),
-    webhookTokenCreatedAt: row.webhook_token_created_at || null,
-    webhookTokenRotatedAt: row.webhook_token_rotated_at || null,
-    lastWebhookAt: row.last_webhook_at || null,
+    configured,
+    apiKeyMasked: ingestionOnly ? null : maskSecret(primary),
+    webhookSecretConfigured: ingestionOnly ? false : Boolean(webhookSecret),
+    webhookSecretMasked: ingestionOnly ? null : maskSecret(webhookSecret),
+    providerAccountId: ingestionOnly ? null : row.provider_account_id || null,
+    shopDomain: ingestionOnly ? null : shopDomainFromRow(row, secrets),
+    authorizationStatus: salla.authorizationStatus || null,
+    merchantName: salla.merchantName || null,
+    tokenExpiresAt: salla.tokenExpiresAt || null,
+    webhookUrl: revealedToken ? buildWebhookUrl(row.provider, revealedToken) : null,
+    webhookConfigured: ingestionOnly ? false : Boolean(row.webhook_token_hash),
+    webhookTokenCreatedAt: ingestionOnly ? null : row.webhook_token_created_at || null,
+    webhookTokenRotatedAt: ingestionOnly ? null : row.webhook_token_rotated_at || null,
+    lastWebhookAt: ingestionOnly ? null : row.last_webhook_at || null,
     createdAt: row.created_at || null,
     updatedAt: row.updated_at || null,
   };
@@ -209,6 +303,9 @@ async function getConnectionRow(integrationId) {
 }
 
 function buildWebhookColumns(provider, { rotate = false, existing = null } = {}) {
+  if (isIngestionOnlyProvider(provider)) {
+    return {};
+  }
   assertProvider(provider);
   if (!rotate && existing?.webhook_token_hash) {
     return {};
@@ -234,6 +331,42 @@ async function listConnections(companyId) {
   return (data || []).map((row) => publicConnectionView(row));
 }
 
+const PLATFORM_INTEGRATION_OVERVIEW_SELECT =
+  "id,company_id,category,provider,name,is_enabled,provider_account_id,settings,webhook_token_hash,created_at,updated_at";
+
+async function listAllConnectionsOverview() {
+  const [{ data: companies, error: companyError }, { data: rows, error }] =
+    await Promise.all([
+      supabase.from(COMPANIES_TABLE).select("id,name").order("name", {
+        ascending: true,
+      }),
+      supabase.from(INTEGRATIONS_TABLE).select(PLATFORM_INTEGRATION_OVERVIEW_SELECT),
+    ]);
+  if (companyError) throw new Error(companyError.message);
+  if (error) throw new Error(error.message);
+
+  const names = new Map(
+    (companies || []).map((row) => [String(row.id), String(row.name || "")]),
+  );
+  return (rows || []).map((row) => ({
+    id: row.id,
+    companyId: row.company_id,
+    companyName: names.get(String(row.company_id)) || "",
+    category: row.category,
+    provider: row.provider,
+    name: row.name,
+    enabled: Boolean(row.is_enabled),
+    providerAccountId: row.provider_account_id || null,
+    shopDomain:
+      row.settings && typeof row.settings === "object"
+        ? row.settings.shopDomain || row.settings.shop_domain || null
+        : null,
+    webhookConfigured: Boolean(row.webhook_token_hash),
+    createdAt: row.created_at || null,
+    updatedAt: row.updated_at || null,
+  }));
+}
+
 async function getConnection(companyId, integrationId) {
   await getCompanyOrThrow(companyId);
   const row = await getConnectionRow(integrationId);
@@ -254,9 +387,29 @@ async function createConnection(companyId, body = {}) {
     throw error;
   }
   const def = assertProviderCategory(body.provider, body.category);
-  const incomingSecrets = normalizeIncomingSecrets(def.provider, body);
-  const webhookFields = buildWebhookColumns(def.provider, { rotate: true });
-  const { webhookToken, ...webhookColumns } = webhookFields;
+  const incomingSecrets = def.ingestionOnly
+    ? {}
+    : normalizeIncomingSecrets(def.provider, body);
+  const webhookFields = def.ingestionOnly
+    ? {}
+    : buildWebhookColumns(def.provider, { rotate: true });
+  const webhookToken = webhookFields.webhookToken || null;
+  const webhookColumns = { ...webhookFields };
+  delete webhookColumns.webhookToken;
+  let settings = def.ingestionOnly
+    ? {}
+    : mergeConnectionSettings({}, body, def.provider);
+  if (def.provider === "salla") {
+    const hasRefresh = Boolean(
+      String(incomingSecrets.refreshToken || incomingSecrets.refresh_token || "").trim(),
+    );
+    const hasAccess = Boolean(String(incomingSecrets.accessToken || "").trim());
+    settings.authorizationStatus = hasRefresh
+      ? "connected"
+      : hasAccess
+        ? "legacy_unmanaged"
+        : "pending";
+  }
 
   const payload = {
     company_id: companyId,
@@ -267,9 +420,10 @@ async function createConnection(companyId, body = {}) {
       ? Boolean(body.enabled ?? body.is_enabled)
       : true,
     credentials: encryptJson(incomingSecrets),
-    settings: mergeConnectionSettings({}, body),
-    provider_account_id:
-      body.providerAccountId || body.provider_account_id || null,
+    settings,
+    provider_account_id: def.ingestionOnly
+      ? null
+      : body.providerAccountId || body.provider_account_id || null,
     ...webhookColumns,
   };
 
@@ -304,26 +458,42 @@ async function updateConnection(companyId, integrationId, body = {}) {
   if (body.enabled != null || body.is_enabled != null) {
     updates.is_enabled = Boolean(body.enabled ?? body.is_enabled);
   }
-  if (body.providerAccountId !== undefined || body.provider_account_id !== undefined) {
+  const ingestionOnly = isIngestionOnlyProvider(existing.provider);
+  if (
+    !ingestionOnly &&
+    (body.providerAccountId !== undefined || body.provider_account_id !== undefined)
+  ) {
     updates.provider_account_id =
       body.providerAccountId || body.provider_account_id || null;
   }
-  if (settingsTouched(body)) {
-    updates.settings = mergeConnectionSettings(existing.settings, body);
+  if (!ingestionOnly && settingsTouched(body)) {
+    updates.settings = mergeConnectionSettings(
+      existing.settings,
+      body,
+      existing.provider,
+    );
   }
 
-  const incomingSecrets = normalizeIncomingSecrets(existing.provider, body);
+  const incomingSecrets = ingestionOnly
+    ? {}
+    : normalizeIncomingSecrets(existing.provider, body);
   if (Object.keys(incomingSecrets).length) {
     const previous = existing.credentials ? decryptSecrets(existing.credentials) : {};
     const nextSecrets = { ...previous, ...incomingSecrets };
+    delete nextSecrets.apiBaseUrl;
+    delete nextSecrets.api_base_url;
     const legacyDomain = nextSecrets.shopDomain || nextSecrets.shop_domain;
     delete nextSecrets.shopDomain;
     delete nextSecrets.shop_domain;
     updates.credentials = encryptJson(nextSecrets);
     if (legacyDomain && !shopDomainFromRow({ settings: updates.settings || existing.settings })) {
-      updates.settings = mergeConnectionSettings(updates.settings || existing.settings, {
-        settings: { shopDomain: String(legacyDomain).trim() },
-      });
+      updates.settings = mergeConnectionSettings(
+        updates.settings || existing.settings,
+        {
+          settings: { shopDomain: String(legacyDomain).trim() },
+        },
+        existing.provider,
+      );
     }
   }
 
@@ -350,6 +520,12 @@ async function rotateWebhookToken(companyId, integrationId) {
     error.code = "INTEGRATION_NOT_FOUND";
     throw error;
   }
+  if (isIngestionOnlyProvider(existing.provider)) {
+    throw spreadsheetUnsupported(
+      "SPREADSHEET_WEBHOOK_UNSUPPORTED",
+      "Historical spreadsheet sources do not use webhooks",
+    );
+  }
   const webhookFields = buildWebhookColumns(existing.provider, {
     rotate: true,
     existing,
@@ -366,6 +542,25 @@ async function rotateWebhookToken(companyId, integrationId) {
   return publicConnectionView(data, webhookToken);
 }
 
+function integrationInUse() {
+  const error = new Error(
+    "This integration still has attributed orders, products, or shipping data and cannot be deleted. Disable it instead.",
+  );
+  error.code = "INTEGRATION_IN_USE";
+  return error;
+}
+
+async function hasAttributedRows(table, column, companyId, integrationId) {
+  const { data, error } = await supabase
+    .from(table)
+    .select("id")
+    .eq("company_id", companyId)
+    .eq(column, integrationId)
+    .limit(1);
+  if (error) throw new Error(error.message);
+  return Boolean(data?.length);
+}
+
 async function deleteConnection(companyId, integrationId) {
   await getCompanyOrThrow(companyId);
   const existing = await getConnectionRow(integrationId);
@@ -374,12 +569,58 @@ async function deleteConnection(companyId, integrationId) {
     error.code = "INTEGRATION_NOT_FOUND";
     throw error;
   }
+
+  const PRODUCTS_TABLE = process.env.SUPABASE_PRODUCTS_TABLE || "products";
+  const MAPPINGS_TABLE =
+    process.env.SUPABASE_BOSTA_SKU_MAPPINGS_TABLE || "bosta_sku_mappings";
+  const UNMAPPED_TABLE =
+    process.env.SUPABASE_BOSTA_UNMAPPED_PRODUCTS_TABLE || "bosta_unmapped_products";
+  const CATALOG_SOURCE_MAPPINGS_TABLE = "catalog_source_mappings";
+  const FULFILLMENT_ITEM_MAPPINGS_TABLE = "fulfillment_item_mappings";
+  const ORDER_ITEMS_TABLE = process.env.SUPABASE_ORDER_ITEMS_TABLE || "order_items";
+
+  if (
+    (await hasAttributedRows(ORDERS_TABLE, "source_integration_id", companyId, integrationId)) ||
+    (await hasAttributedRows(ORDERS_TABLE, "shipping_integration_id", companyId, integrationId)) ||
+    (await hasAttributedRows(PRODUCTS_TABLE, "source_integration_id", companyId, integrationId)) ||
+    (await hasAttributedRows(MAPPINGS_TABLE, "shipping_integration_id", companyId, integrationId)) ||
+    (await hasAttributedRows(UNMAPPED_TABLE, "shipping_integration_id", companyId, integrationId)) ||
+    (await hasAttributedRows(
+      CATALOG_SOURCE_MAPPINGS_TABLE,
+      "integration_id",
+      companyId,
+      integrationId,
+    )) ||
+    (await hasAttributedRows(
+      FULFILLMENT_ITEM_MAPPINGS_TABLE,
+      "shipping_integration_id",
+      companyId,
+      integrationId,
+    )) ||
+    (await hasAttributedRows(
+      ORDER_ITEMS_TABLE,
+      "source_integration_id",
+      companyId,
+      integrationId,
+    ))
+  ) {
+    throw integrationInUse();
+  }
+
   const { error } = await supabase
     .from(INTEGRATIONS_TABLE)
     .delete()
     .eq("id", integrationId)
     .eq("company_id", companyId);
-  if (error) throw new Error(error.message);
+  if (error) {
+    if (
+      error.code === "23503" ||
+      String(error.message || "").toLowerCase().includes("foreign key")
+    ) {
+      throw integrationInUse();
+    }
+    throw new Error(error.message);
+  }
   return { id: integrationId, deleted: true };
 }
 
@@ -424,6 +665,12 @@ async function resolveOwnedConnection({
 
   if (!provider) {
     throw integrationNotConfigured("integration");
+  }
+
+  if (String(provider || "").toLowerCase() === "salla") {
+    const error = new Error("An exact Salla integrationId is required");
+    error.code = "SALLA_INTEGRATION_REQUIRED";
+    throw error;
   }
 
   const { data, error } = await supabase
@@ -507,7 +754,45 @@ async function markWebhookReceived(integrationId) {
 }
 
 async function testConnection(companyId, integrationId) {
-  const view = await getConnection(companyId, integrationId);
+  await getCompanyOrThrow(companyId);
+  const row = await getConnectionRow(integrationId);
+  if (!row || row.company_id !== companyId) {
+    const error = new Error("Integration connection not found");
+    error.code = "INTEGRATION_NOT_FOUND";
+    throw error;
+  }
+
+  if (isIngestionOnlyProvider(row.provider)) {
+    throw spreadsheetUnsupported(
+      "SPREADSHEET_REMOTE_TEST_UNSUPPORTED",
+      "Historical spreadsheet sources do not support remote connection tests",
+    );
+  }
+
+  if (String(row.provider || "").toLowerCase() === "shopify") {
+    let secrets = {};
+    try {
+      secrets = decryptSecrets(row.credentials);
+    } catch {
+      secrets = {};
+    }
+    const { testShopifyConnection } = require("./shopify.service");
+    return testShopifyConnection({
+      integration: row,
+      secrets,
+      allowDisabled: true,
+    });
+  }
+
+  if (String(row.provider || "").toLowerCase() === "salla") {
+    const { testSallaConnection } = require("./sallaClient.service");
+    return testSallaConnection({
+      integration: row,
+      allowDisabled: true,
+    });
+  }
+
+  const view = publicConnectionView(row);
   return {
     ok: view.configured && view.enabled,
     configured: view.configured,
@@ -519,6 +804,7 @@ async function testConnection(companyId, integrationId) {
 
 module.exports = {
   listConnections,
+  listAllConnectionsOverview,
   getConnection,
   createConnection,
   updateConnection,
